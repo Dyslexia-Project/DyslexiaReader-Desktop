@@ -1,0 +1,137 @@
+# =============================================================================
+# DyslexiaReader-Desktop — C++ CI Build Pipeline
+# =============================================================================
+# Triggers : every push and pull-request targeting `main`
+# Runner   : windows-latest  (Windows Server 2022, MSVC + CMake pre-installed)
+# Output   : a zip artifact named `DyslexiaReader-Desktop-<sha>` containing
+#            the unpackaged Win32 .exe and all runtime dependencies (fonts, etc.)
+# =============================================================================
+
+name: C++ Desktop CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+# Cancel any in-progress run for the same branch when a new one starts.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Win32 .exe (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. Check out source
+      # ------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history so git describe works
+
+      # ------------------------------------------------------------------
+      # 2. Set up Visual Studio developer environment
+      #    (windows-latest already ships VS 2022; this step exposes cl.exe
+      #     and the MSVC toolchain on PATH for CMake's MSVC generator.)
+      # ------------------------------------------------------------------
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64              # target architecture — change to x86 if needed
+
+      # ------------------------------------------------------------------
+      # 3. Cache CMake build artifacts between runs
+      # ------------------------------------------------------------------
+      - name: Cache CMake build directory
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: cmake-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt', '**/CMakePresets.json') }}
+          restore-keys: |
+            cmake-${{ runner.os }}-
+
+      # ------------------------------------------------------------------
+      # 4. Configure with CMake
+      #
+      #    ADJUST: If you use CMakePresets.json, replace the cmake call with:
+      #      cmake --preset windows-release
+      #    or whichever preset targets the Win32 release build.
+      # ------------------------------------------------------------------
+      - name: Configure CMake
+        run: |
+          cmake -B build `
+                -G "Visual Studio 17 2022" `
+                -A x64 `
+                -DCMAKE_BUILD_TYPE=Release `
+                -DBUILD_TESTS=OFF
+        # ADJUST: add extra -D flags here for your project, e.g.:
+        #   -DENABLE_OCR=ON  -DENABLE_TTS=ON
+
+      # ------------------------------------------------------------------
+      # 5. Build the Release target
+      # ------------------------------------------------------------------
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # ------------------------------------------------------------------
+      # 6. Assemble the portable artifact directory
+      #
+      #    ADJUST: change `build\Release\DyslexiaReader.exe` to wherever
+      #    CMake actually places the output executable in your project.
+      #    Also add any extra runtime files (DLLs, fonts, resources) below.
+      # ------------------------------------------------------------------
+      - name: Assemble artifact
+        shell: pwsh
+        run: |
+          $artifactDir = "artifact\DyslexiaReader-Desktop"
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+
+          # --- Main executable ---
+          # ADJUST path if your CMakeLists names the target differently
+          $exePath = "build\Release\DyslexiaReader.exe"
+          if (Test-Path $exePath) {
+            Copy-Item $exePath -Destination $artifactDir
+          } else {
+            Write-Error "Executable not found at $exePath — check CMakeLists target name."
+            exit 1
+          }
+
+          # --- Bundled fonts (required for offline reading on clean machines) ---
+          # ADJUST: change `fonts\` to the actual folder in your repository
+          if (Test-Path "fonts") {
+            Copy-Item -Recurse "fonts" -Destination "$artifactDir\fonts"
+          } else {
+            Write-Warning "No fonts\ directory found — skip bundling fonts."
+          }
+
+          # --- Any extra DLLs / resources your app needs at runtime ---
+          # ADJUST: add more Copy-Item calls here, e.g.:
+          #   Copy-Item "third_party\tessdata" -Destination "$artifactDir\tessdata" -Recurse
+          #   Copy-Item "build\Release\*.dll" -Destination $artifactDir
+
+          # --- Emit a build-info file (useful for QA traceability) ---
+          @"
+          DyslexiaReader Desktop Build Info
+          ==================================
+          Commit  : ${{ github.sha }}
+          Ref     : ${{ github.ref_name }}
+          Runner  : ${{ runner.os }}
+          Built   : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC' -AsUTC)
+          "@ | Set-Content "$artifactDir\BUILD_INFO.txt"
+
+      # ------------------------------------------------------------------
+      # 7. Upload the artifact
+      #    Retained for 30 days; download from the GitHub Actions run page.
+      # ------------------------------------------------------------------
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DyslexiaReader-Desktop-${{ github.sha }}
+          path: artifact\
+          retention-days: 30
+          if-no-files-found: error
