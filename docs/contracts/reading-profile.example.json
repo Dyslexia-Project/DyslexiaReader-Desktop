@@ -1,0 +1,16 @@
+{
+    "schemaVersion": 1,
+    "fontFamily": "Lexend",
+    "fontSizePt": 20,
+    "letterSpacingEm": 0.02,
+    "wordSpacingEm": 0.1,
+    "lineHeight": 1.6,
+    "lineWidthCh": 65,
+    "theme": "warm-cream",
+    "aids": {
+      "bionicReading": false,
+      "readingRuler": false,
+      "bimodalHighlighting": true
+    }
+  }
+  
