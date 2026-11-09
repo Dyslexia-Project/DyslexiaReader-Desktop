@@ -4,7 +4,39 @@ A free, native desktop reading assistant that turns text captured from the scree
 
 **Repository:** [DyslexiaApp](https://github.com/Dyslexia-Project/DyslexiaApp). The dashboard and backend are maintained in [DyslexiaPlatform](https://github.com/Dyslexia-Project/DyslexiaPlatform).
 
-**Status:** planning. This README describes the intended product and architecture; features and performance are not implemented or measured yet.
+**Status:** the C++ reader scaffold, bundled fonts, live typography/theme controls, visual reading aids, offline Windows speech controls, bimodal playback highlighting, and a provisional cloud speech client/cache are implemented. The Windows-specific targets still require validation with the Windows SDK.
+
+## Building the Windows prototype
+
+Use Visual Studio's C++ desktop workload with a Windows 10 SDK, then run from
+PowerShell or a Developer Command Prompt:
+
+```powershell
+cmake -S . -B build -A x64
+cmake --build build --config Debug
+.\build\Debug\dyslexia_reader_demo.exe
+```
+
+The in-memory font loader uses `IDWriteFactory5` and requires Windows 10 build
+15063 or later. The demo displays deterministic mock OCR content; it does not
+perform screen capture or OCR.
+
+The reader toolbar supports font family, font size, letter spacing, line height,
+Bionic emphasis, the interactive Reading Ruler, semantic color themes, local
+voice selection, bimodal highlighting, Play/Pause, Stop, and speech speed.
+Local speech is synthesized off the UI thread; reliable Windows timed speech
+cues drive sentence tint and DirectWrite-bound word outlines. The highlighting
+control is independent of audio playback.
+The WinRT API does not expose a `SpeechBookmarkReached` event, so the adapter
+uses the documented word/sentence boundary metadata instead. Changes redraw the
+existing mock-fed text without repeating OCR. Native Windows compilation and
+visual behavior have not yet been validated on this Linux development host.
+The cloud client requires an HTTPS service base URL and an injected optional
+bearer-token provider. Its provisional request/response schema is
+`docs/contracts/cloud-speech-v1.schema.json`; the linked Spring Boot repository
+does not yet implement that endpoint, so server compatibility is unverified.
+The cloud client/cache are not yet wired to a reader-toolbar opt-in or playback
+path; cloud UI integration remains a follow-up.
 
 Windows is the first target. macOS support is planned after the Windows workflow is validated.
 
@@ -98,6 +130,9 @@ For future macOS support, reuse portable engine logic and replace the platform-s
 ## Engine boundaries and versions
 
 Keep the engine separate from the tray UI within this repository. It should expose capture-processing orchestration, OCR and speech provider interfaces, and reading-profile logic without depending on the web platform.
+
+The initial portable interfaces, domain contracts, mock providers, and implementation sequence are documented in [the desktop engine architecture](docs/architecture/desktop-engine-architecture.md).
+The bundled font assets and their redistribution notices are listed in [third-party font notices](docs/third-party-fonts.md).
 
 Start with one bundled engine and display separate versions in Settings → About and diagnostic reports:
 

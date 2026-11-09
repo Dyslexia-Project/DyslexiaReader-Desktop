@@ -1,0 +1,162 @@
+#pragma once
+
+#include "dyslexia_reader/interfaces.hpp"
+#include "dyslexia_reader/windows/reading_aids.hpp"
+
+#include <windows.h>
+#include <d2d1.h>
+#include <dwrite.h>
+#include <dwrite_2.h>
+#include <commctrl.h>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <wrl/client.h>
+
+namespace dyslexia_reader::windows {
+
+class InMemoryFontCollection;
+
+class Direct2DTextRenderer final : public ITextRenderer {
+public:
+    explicit Direct2DTextRenderer(IFontLoader& fontLoader,
+                                  ISpeechEngine* speechEngine = nullptr);
+    ~Direct2DTextRenderer() override;
+
+    Direct2DTextRenderer(const Direct2DTextRenderer&) = delete;
+    Direct2DTextRenderer& operator=(const Direct2DTextRenderer&) = delete;
+
+    // Create, show, and use the renderer on one UI thread.
+    HWND create_reader_window(HINSTANCE instance, HWND owner = nullptr);
+    void show(int showCommand);
+    HWND hwnd() const noexcept { return hwnd_; }
+
+    void set_document(const ReadingDocument& document) override;
+    void set_profile(const ReadingProfile& profile) override;
+    void set_viewport(const Viewport& viewport) override;
+    TextLayoutSnapshot layout_snapshot() const override;
+    void set_aid_visuals(const AidVisuals& visuals) override;
+    void set_highlights(const HighlightState& highlights) override;
+    void invalidate() override;
+
+private:
+    static LRESULT CALLBACK window_proc(HWND window, UINT message,
+                                       WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK toolbar_control_proc(
+        HWND control, UINT message, WPARAM wParam, LPARAM lParam,
+        UINT_PTR subclassId, DWORD_PTR referenceData);
+    LRESULT handle_message(UINT message, WPARAM wParam, LPARAM lParam);
+
+    void ensure_render_target();
+    void create_toolbar_controls();
+    void layout_toolbar_controls();
+    void sync_toolbar_controls();
+    void handle_command(int controlId, int notificationCode);
+    void handle_horizontal_scroll(HWND control);
+    void initialize_speech_controls();
+    void handle_speech_command(int controlId);
+    void handle_speech_event(const SpeechEvent& event);
+    TextLayoutSnapshot line_layout_snapshot() const;
+    std::vector<RectF> text_range_bounds(TextRange range) const;
+    AidVisuals compose_bimodal_highlights() const;
+    void refresh_aid_visuals();
+    void refresh_highlight_visuals();
+    void select_ruler_line_at(int pixelY);
+    void move_ruler_line(int direction);
+    bool handle_ruler_key(WPARAM key);
+    void rebuild_text_layout();
+    void discard_device_resources() noexcept;
+    void paint();
+    void resize_viewport();
+    void require_ui_thread() const;
+
+    static constexpr wchar_t kWindowClassName[] =
+        L"DyslexiaReader.Direct2DReaderWindow";
+    static constexpr float kToolbarHeightDip = 156;
+    static constexpr float kTextPaddingDip = 24;
+    static constexpr int kFontFamilyControlId = 1001;
+    static constexpr int kFontSizeDecreaseControlId = 1002;
+    static constexpr int kFontSizeIncreaseControlId = 1003;
+    static constexpr int kThemeControlId = 1004;
+    static constexpr int kLetterSpacingControlId = 1005;
+    static constexpr int kLineHeightControlId = 1006;
+    static constexpr int kBionicReadingControlId = 1007;
+    static constexpr int kReadingRulerControlId = 1008;
+    static constexpr int kBimodalHighlightingControlId = 1013;
+    static constexpr int kSpeechVoiceControlId = 1009;
+    static constexpr int kSpeechPlayControlId = 1010;
+    static constexpr int kSpeechStopControlId = 1011;
+    static constexpr int kSpeechRateControlId = 1012;
+    static constexpr UINT kSpeechEventMessage = WM_APP + 0x31;
+
+    struct SpeechDispatchState {
+        struct Event {
+            std::uint64_t session = 0;
+            SpeechEvent speech;
+        };
+
+        std::mutex mutex;
+        HWND window = nullptr;
+        std::deque<Event> pendingEvents;
+    };
+
+    HINSTANCE instance_ = nullptr;
+    HWND hwnd_ = nullptr;
+    DWORD uiThreadId_ = 0;
+    UINT dpiX_ = USER_DEFAULT_SCREEN_DPI;
+    UINT dpiY_ = USER_DEFAULT_SCREEN_DPI;
+
+    Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory_;
+    Microsoft::WRL::ComPtr<IDWriteFactory> dwriteFactory_;
+    std::unique_ptr<InMemoryFontCollection> fontCollection_;
+    Microsoft::WRL::ComPtr<ID2D1HwndRenderTarget> renderTarget_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> textBrush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> rulerBrush_;
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> textFormat_;
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> textLayout_;
+    Microsoft::WRL::ComPtr<IDWriteTextLayout1> textLayout1_;
+
+    ReadingDocument document_;
+    ReadingProfile profile_;
+    Viewport viewport_;
+    AidVisuals aidVisuals_;
+    HighlightState highlights_;
+    BionicReadingAid bionicReadingAid_;
+    ReadingRulerAid readingRulerAid_;
+    BimodalHighlightingAid bimodalHighlightingAid_;
+    ISpeechEngine* speechEngine_ = nullptr;
+    std::shared_ptr<SpeechDispatchState> speechDispatch_;
+    std::vector<VoiceInfo> speechVoices_;
+    SpeechCapabilities speechCapabilities_;
+    std::uint64_t speechSession_ = 0;
+    PlaybackState speechState_ = PlaybackState::Idle;
+    float speechRate_ = 1.0F;
+    bool speechAvailable_ = false;
+    std::optional<std::uint32_t> activeVisualLine_;
+    std::optional<TextOffset> rulerAnchorOffset_;
+
+    HWND fontFamilyCombo_ = nullptr;
+    HWND fontFamilyLabel_ = nullptr;
+    HWND decreaseFontButton_ = nullptr;
+    HWND increaseFontButton_ = nullptr;
+    HWND fontSizeLabel_ = nullptr;
+    HWND themeLabel_ = nullptr;
+    HWND themeCombo_ = nullptr;
+    HWND letterSpacingTrackbar_ = nullptr;
+    HWND letterSpacingLabel_ = nullptr;
+    HWND lineHeightTrackbar_ = nullptr;
+    HWND lineHeightCaption_ = nullptr;
+    HWND lineHeightLabel_ = nullptr;
+    HWND bionicReadingCheckBox_ = nullptr;
+    HWND readingRulerCheckBox_ = nullptr;
+    HWND bimodalHighlightingCheckBox_ = nullptr;
+    HWND speechVoiceLabel_ = nullptr;
+    HWND speechVoiceCombo_ = nullptr;
+    HWND speechPlayButton_ = nullptr;
+    HWND speechStopButton_ = nullptr;
+    HWND speechRateCaption_ = nullptr;
+    HWND speechRateTrackbar_ = nullptr;
+    HWND speechRateLabel_ = nullptr;
+};
+
+}  // namespace dyslexia_reader::windows

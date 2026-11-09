@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Dyslexia Reader Cloud Speech v1",
+  "description": "Provisional client/server contract for POST /api/v1/speech/synthesize.",
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" }
+  ],
+  "$defs": {
+    "speechMark": {
+      "type": "object",
+      "required": ["type", "start", "length", "timeMilliseconds"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["word", "sentence"]
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "UTF-16 code-unit offset in the submitted text."
+        },
+        "length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "UTF-16 code-unit length in the submitted text."
+        },
+        "timeMilliseconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "audioChunk": {
+      "type": "object",
+      "required": ["mediaType", "dataBase64"],
+      "properties": {
+        "mediaType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "dataBase64": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 89478490,
+          "contentEncoding": "base64"
+        }
+      },
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "required": [
+        "text",
+        "voiceId",
+        "rate",
+        "includeAudio",
+        "includeSpeechMarks"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "voiceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "rate": {
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 2.0
+        },
+        "includeAudio": {
+          "const": true
+        },
+        "includeSpeechMarks": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "response": {
+      "type": "object",
+      "required": [
+        "audioChunks",
+        "speechMarks",
+        "wordTimingReliable",
+        "sentenceTimingReliable"
+      ],
+      "properties": {
+        "audioChunks": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/audioChunk"
+          }
+        },
+        "speechMarks": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/speechMark"
+          }
+        },
+        "wordTimingReliable": {
+          "type": "boolean"
+        },
+        "sentenceTimingReliable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

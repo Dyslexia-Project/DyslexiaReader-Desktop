@@ -1,0 +1,7 @@
+#include "@CMAKE_CURRENT_SOURCE_DIR@/resources/font_resource_ids.h"
+
+IDR_FONT_LEXEND RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/assets/fonts/Lexend-Variable.ttf"
+IDR_FONT_ATKINSON_REGULAR RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/assets/fonts/AtkinsonHyperlegible-Regular.ttf"
+IDR_FONT_ATKINSON_BOLD RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/assets/fonts/AtkinsonHyperlegible-Bold.ttf"
+IDR_FONT_OPENDYSLEXIC_REGULAR RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/assets/fonts/OpenDyslexic-Regular.otf"
+IDR_FONT_OPENDYSLEXIC_BOLD RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/assets/fonts/OpenDyslexic-Bold.otf"
