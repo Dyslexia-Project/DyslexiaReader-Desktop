@@ -3,6 +3,12 @@
 
 #include <string>
 
+#if __has_include(<leptonica/allheaders.h>)
+#include <leptonica/allheaders.h>
+#elif __has_include(<allheaders.h>)
+#include <allheaders.h>
+#endif
+
 namespace DyslexiaReader {
 
 class OcrService {
@@ -10,10 +16,10 @@ public:
     OcrService();
     ~OcrService();
 
-    // Metodă unică apelată de aplicație (indiferent de OS)
+    // Main capture and recognition method invoked by the application (cross-platform)
     std::string captureAndRecognizeText();
 
-    // Recunoaștere dintr-o imagine existentă pe disc
+    // Recognize text from an existing image file on disk
     std::string recognizeTextFromImage(const std::string& imagePath);
 };
 

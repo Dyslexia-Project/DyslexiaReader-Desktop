@@ -1,5 +1,5 @@
 # ==============================================================================
-# 0. Suport vcpkg pentru Windows (trebuie să fie înainte de project())
+# 0. vcpkg support for Windows (must precede project())
 # ==============================================================================
 if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
@@ -12,9 +12,10 @@ project(DyslexiaReaderDesktop LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ==============================================================================
-# 1. Dependențe Tesseract OCR & Leptonica (Cross-Platform)
+# 1. Tesseract OCR & Leptonica Dependencies (Cross-Platform)
 # ==============================================================================
 find_package(PkgConfig QUIET)
 
@@ -23,7 +24,7 @@ if(PkgConfig_FOUND)
     pkg_check_modules(LEPTONICA lept)
 endif()
 
-# Fallback pentru vcpkg sau pachete de sistem când PkgConfig nu le găsește direct
+# Fallback for vcpkg or system packages when PkgConfig does not find them directly
 if(NOT TESSERACT_FOUND)
     find_package(Tesseract REQUIRED)
 endif()
@@ -32,16 +33,16 @@ if(NOT LEPTONICA_FOUND)
     find_package(Leptonica REQUIRED)
 endif()
 
-# Adăugăm directoarele de librării pentru macOS / Homebrew
+# Add library directories for macOS / Homebrew
 if(TESSERACT_LIBRARY_DIRS OR LEPTONICA_LIBRARY_DIRS)
     link_directories(${TESSERACT_LIBRARY_DIRS} ${LEPTONICA_LIBRARY_DIRS})
 endif()
 
 # ==============================================================================
-# 2. Descărcare automată model OCR (eng.traineddata)
+# 2. Automatic OCR model download (eng.traineddata)
 # ==============================================================================
 if(NOT EXISTS "${CMAKE_BINARY_DIR}/tessdata/eng.traineddata")
-    message(STATUS "[OCR] Se descarca modelul de limba engleza (eng.traineddata)...")
+    message(STATUS "[OCR] Downloading English language model (eng.traineddata)...")
     file(DOWNLOAD 
         "https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata"
         "${CMAKE_BINARY_DIR}/tessdata/eng.traineddata"
@@ -50,8 +51,12 @@ if(NOT EXISTS "${CMAKE_BINARY_DIR}/tessdata/eng.traineddata")
 endif()
 
 # ==============================================================================
-# 3. Module Core & OCR
+# 3. Core & OCR Modules
 # ==============================================================================
+add_library(dyslexia_reader_core src/caching_cloud_speech_client.cpp)
+target_include_directories(dyslexia_reader_core PUBLIC include)
+target_compile_features(dyslexia_reader_core PRIVATE cxx_std_17)
+
 if(WIN32)
     set(OCR_SRC src/windows/ocr_service.cpp)
 else()
@@ -60,10 +65,14 @@ endif()
 
 add_library(dyslexia_reader_ocr ${OCR_SRC})
 target_include_directories(dyslexia_reader_ocr 
-    PUBLIC include 
+    PUBLIC include include/dyslexia_reader
     PRIVATE ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS} /opt/homebrew/include /opt/homebrew/include/leptonica
 )
 target_compile_features(dyslexia_reader_ocr PUBLIC cxx_std_17)
+
+if(TESSERACT_LIBRARY_DIRS OR LEPTONICA_LIBRARY_DIRS)
+    target_link_directories(dyslexia_reader_ocr PRIVATE ${TESSERACT_LIBRARY_DIRS} ${LEPTONICA_LIBRARY_DIRS})
+endif()
 
 if(TESSERACT_LIBRARIES)
     target_link_libraries(dyslexia_reader_ocr PRIVATE ${TESSERACT_LIBRARIES} ${LEPTONICA_LIBRARIES})
@@ -72,7 +81,7 @@ else()
 endif()
 
 # ==============================================================================
-# 4. Teste și Executabile Smoke
+# 4. Tests and Smoke Executables
 # ==============================================================================
 add_executable(contracts_smoke tests/contracts_smoke.cpp)
 target_include_directories(contracts_smoke PRIVATE include)
@@ -86,18 +95,19 @@ add_test(NAME contracts_smoke COMMAND contracts_smoke)
 add_test(NAME cloud_speech_cache_smoke COMMAND cloud_speech_cache_smoke)
 
 # ==============================================================================
-# 5. Target Demo Tesseract pe macOS / Non-Windows
+# 5. Tesseract Demo Target for macOS / Non-Windows
 # ==============================================================================
 if(NOT WIN32)
     add_executable(dyslexia_reader_demo src/main.cpp)
     target_compile_features(dyslexia_reader_demo PRIVATE cxx_std_17)
     target_include_directories(dyslexia_reader_demo 
-        PRIVATE include ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS} /opt/homebrew/include /opt/homebrew/include/leptonica
+        PRIVATE include include/dyslexia_reader ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS} /opt/homebrew/include /opt/homebrew/include/leptonica
     )
-    if(TESSERACT_LIBRARY_DIRS)
+    if(TESSERACT_LIBRARY_DIRS OR LEPTONICA_LIBRARY_DIRS)
         target_link_directories(dyslexia_reader_demo PRIVATE ${TESSERACT_LIBRARY_DIRS} ${LEPTONICA_LIBRARY_DIRS})
     endif()
     
+    target_link_libraries(dyslexia_reader_demo PRIVATE dyslexia_reader_ocr)
     if(TESSERACT_LIBRARIES)
         target_link_libraries(dyslexia_reader_demo PRIVATE ${TESSERACT_LIBRARIES} ${LEPTONICA_LIBRARIES})
     else()
@@ -106,7 +116,7 @@ if(NOT WIN32)
 endif()
 
 # ==============================================================================
-# 6. Target-uri specifice pentru Windows (Visual Studio / Direct2D)
+# 6. Windows-specific targets (Visual Studio / Direct2D)
 # ==============================================================================
 if(WIN32)
     enable_language(RC)

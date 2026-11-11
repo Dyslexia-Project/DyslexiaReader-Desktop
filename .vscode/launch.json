@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run OCR Demo (Image)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/dyslexia_reader_demo",
+            "args": ["${workspaceFolder}/test.png"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "lldb"
+        },
+        {
+            "name": "Run OCR Demo (Screen Capture)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/dyslexia_reader_demo",
+            "args": ["--capture"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "lldb"
+        }
+    ]
+}
