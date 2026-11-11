@@ -1,0 +1,8 @@
+{
+  "name": "dyslexia-reader-desktop",
+  "version-string": "1.0.0",
+  "dependencies": [
+    "tesseract",
+    "leptonica"
+  ]
+}
