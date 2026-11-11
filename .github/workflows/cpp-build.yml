@@ -26,24 +26,13 @@ jobs:
         with:
           arch: x64
 
-      - name: Cache CMake build directory
-        uses: actions/cache@v4
-        with:
-          path: build
-          key: cmake-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt', '**/CMakePresets.json') }}
-          restore-keys: |
-            cmake-${{ runner.os }}-
-
       - name: Configure CMake
-        shell: cmd
-        run: cmake -B build -S . -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        shell: cmd
         run: cmake --build build --config Release --parallel
 
       - name: Run CTest Unit Tests
-        shell: cmd
         run: ctest --test-dir build -C Release --output-on-failure
 
       - name: Assemble portable release artifact
@@ -52,15 +41,15 @@ jobs:
           $artifactDir = "artifact\DyslexiaReader-Desktop"
           New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
 
-          # Search for compiled executables in build\Release
-          $exeFiles = Get-ChildItem -Path "build\Release" -Filter "*.exe" -Recurse
+          # Search for compiled executables in build
+          $exeFiles = Get-ChildItem -Path "build" -Filter "*.exe" -Recurse
           if ($exeFiles.Count -gt 0) {
             foreach ($exe in $exeFiles) {
               Copy-Item $exe.FullName -Destination $artifactDir
               Write-Host "Bundled executable: $($exe.Name)"
             }
           } else {
-            Write-Error "No executable found in build\Release!"
+            Write-Error "No executable found in build!"
             exit 1
           }
 
