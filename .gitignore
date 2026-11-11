@@ -2,4 +2,5 @@
 .venv/
 
 # macOS system files
-.DS_Store
+.DS_Storebuild/
+build/
