@@ -1,0 +1,33 @@
+{
+    "warm-cream": {
+      "background": "#FFFDD0",
+      "text": "#111111",
+      "surface": "#FFF8E7",
+      "border": "#70644D",
+      "focus": "#155EEF",
+      "sentenceHighlight": "#DCEBFF",
+      "wordHighlightBorder": "#155EEF",
+      "rulerHighlight": "#E4E9B4"
+    },
+    "sepia": {
+      "background": "#F4ECD8",
+      "text": "#3B3026",
+      "surface": "#EDE1C8",
+      "border": "#75634F",
+      "focus": "#174EA6",
+      "sentenceHighlight": "#D9E7ED",
+      "wordHighlightBorder": "#174EA6",
+      "rulerHighlight": "#E1D7B9"
+    },
+    "dark-high-contrast": {
+      "background": "#121212",
+      "text": "#F5F5F5",
+      "surface": "#242424",
+      "border": "#A0A0A0",
+      "focus": "#FFD166",
+      "sentenceHighlight": "#263B53",
+      "wordHighlightBorder": "#FFD166",
+      "rulerHighlight": "#333D2B"
+    }
+  }
+  

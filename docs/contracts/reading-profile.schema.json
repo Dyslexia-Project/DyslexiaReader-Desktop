@@ -1,0 +1,109 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://github.com/Dyslexia-Project/DyslexiaPlatform/blob/main/docs/contracts/reading-profile.schema.json",
+    "title": "Dyslexia Reader - Reading Profile",
+    "description": "Shared reading preferences for desktop and web clients.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "schemaVersion",
+      "fontFamily",
+      "fontSizePt",
+      "letterSpacingEm",
+      "wordSpacingEm",
+      "lineHeight",
+      "lineWidthCh",
+      "theme",
+      "aids"
+    ],
+    "properties": {
+      "schemaVersion": {
+        "type": "integer",
+        "const": 1,
+        "default": 1,
+        "description": "Version of the reading profile contract."
+      },
+      "fontFamily": {
+        "type": "string",
+        "enum": [
+          "Lexend",
+          "Atkinson Hyperlegible",
+          "OpenDyslexic"
+        ],
+        "default": "Lexend",
+        "description": "Font used to display reading content."
+      },
+      "fontSizePt": {
+        "type": "number",
+        "minimum": 14,
+        "maximum": 48,
+        "default": 20,
+        "description": "Font size in typographic points."
+      },
+      "letterSpacingEm": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 0.2,
+        "default": 0.02,
+        "description": "Additional spacing between letters in em units."
+      },
+      "wordSpacingEm": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 0.5,
+        "default": 0.1,
+        "description": "Additional spacing between words in em units."
+      },
+      "lineHeight": {
+        "type": "number",
+        "minimum": 1,
+        "maximum": 2.5,
+        "default": 1.6,
+        "description": "Unitless line height multiplier."
+      },
+      "lineWidthCh": {
+        "type": "integer",
+        "minimum": 35,
+        "maximum": 100,
+        "default": 65,
+        "description": "Maximum reading text width in ch units."
+      },
+      "theme": {
+        "type": "string",
+        "enum": [
+          "warm-cream",
+          "sepia",
+          "dark-high-contrast"
+        ],
+        "default": "warm-cream",
+        "description": "Identifier of the selected reading color theme."
+      },
+      "aids": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "bionicReading",
+          "readingRuler",
+          "bimodalHighlighting"
+        ],
+        "properties": {
+          "bionicReading": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enables bold emphasis on the beginning of words."
+          },
+          "readingRuler": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enables a horizontal reading guide."
+          },
+          "bimodalHighlighting": {
+            "type": "boolean",
+            "default": true,
+            "description": "Enables synchronized text highlighting during speech playback when timing information is available."
+          }
+        }
+      }
+    }
+  }
+  

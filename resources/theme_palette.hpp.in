@@ -1,0 +1,37 @@
+#pragma once
+
+#include <string_view>
+
+namespace dyslexia_reader::windows::theme_palette {
+
+struct ThemeHex {
+    std::string_view background;
+    std::string_view text;
+    std::string_view surface;
+    std::string_view border;
+    std::string_view focus;
+    std::string_view sentenceHighlight;
+    std::string_view wordHighlightBorder;
+    std::string_view rulerHighlight;
+};
+
+inline constexpr ThemeHex warmCream{
+    "@WARM_CREAM_BACKGROUND@", "@WARM_CREAM_TEXT@", "@WARM_CREAM_SURFACE@",
+    "@WARM_CREAM_BORDER@", "@WARM_CREAM_FOCUS@",
+    "@WARM_CREAM_SENTENCEHIGHLIGHT@", "@WARM_CREAM_WORDHIGHLIGHTBORDER@",
+    "@WARM_CREAM_RULERHIGHLIGHT@"};
+
+inline constexpr ThemeHex sepia{
+    "@SEPIA_BACKGROUND@", "@SEPIA_TEXT@", "@SEPIA_SURFACE@",
+    "@SEPIA_BORDER@", "@SEPIA_FOCUS@", "@SEPIA_SENTENCEHIGHLIGHT@",
+    "@SEPIA_WORDHIGHLIGHTBORDER@", "@SEPIA_RULERHIGHLIGHT@"};
+
+inline constexpr ThemeHex darkHighContrast{
+    "@DARK_HIGH_CONTRAST_BACKGROUND@", "@DARK_HIGH_CONTRAST_TEXT@",
+    "@DARK_HIGH_CONTRAST_SURFACE@", "@DARK_HIGH_CONTRAST_BORDER@",
+    "@DARK_HIGH_CONTRAST_FOCUS@",
+    "@DARK_HIGH_CONTRAST_SENTENCEHIGHLIGHT@",
+    "@DARK_HIGH_CONTRAST_WORDHIGHLIGHTBORDER@",
+    "@DARK_HIGH_CONTRAST_RULERHIGHLIGHT@"};
+
+}  // namespace dyslexia_reader::windows::theme_palette
