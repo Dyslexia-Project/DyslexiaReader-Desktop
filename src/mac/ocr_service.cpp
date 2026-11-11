@@ -1,8 +1,16 @@
+#include "dyslexia_reader/ocr_service.hpp"
+
 #include <iostream>
 #include <cstdlib>
 #include <cstdio>
+#include <filesystem>
 #include <tesseract/baseapi.h>
-#include "ocr_service.hpp"
+#if __has_include(<leptonica/allheaders.h>)
+#include <leptonica/allheaders.h>
+#elif __has_include(<allheaders.h>)
+#include <allheaders.h>
+#endif
+
 namespace DyslexiaReader {
 
 OcrService::OcrService() {}
@@ -11,16 +19,28 @@ OcrService::~OcrService() {}
 std::string OcrService::recognizeTextFromImage(const std::string& imagePath) {
     tesseract::TessBaseAPI tess;
 
-    if (tess.Init("./tessdata", "eng")) {
-        if (tess.Init(nullptr, "eng")) {
-            std::cerr << "[EROARE OCR] Nu s-a putut inițializa motorul Tesseract." << std::endl;
+    const char* datapath = nullptr;
+    if (std::filesystem::exists("./tessdata/eng.traineddata")) {
+        datapath = "./tessdata";
+    } else if (std::filesystem::exists("./build/tessdata/eng.traineddata")) {
+        datapath = "./build/tessdata";
+    } else if (std::filesystem::exists("/opt/homebrew/share/tessdata/eng.traineddata")) {
+        datapath = "/opt/homebrew/share/tessdata";
+    }
+
+    if (tess.Init(datapath, "eng") != 0) {
+        if (datapath != nullptr && tess.Init(nullptr, "eng") != 0) {
+            std::cerr << "[OCR ERROR] Could not initialize Tesseract engine." << std::endl;
+            return "";
+        } else if (datapath == nullptr) {
+            std::cerr << "[OCR ERROR] Could not initialize Tesseract engine." << std::endl;
             return "";
         }
     }
 
     Pix* image = pixRead(imagePath.c_str());
     if (!image) {
-        std::cerr << "[EROARE OCR] Nu s-a putut deschide imaginea: " << imagePath << std::endl;
+        std::cerr << "[OCR ERROR] Could not open image: " << imagePath << std::endl;
         tess.End();
         return "";
     }
@@ -37,19 +57,19 @@ std::string OcrService::recognizeTextFromImage(const std::string& imagePath) {
 }
 
 std::string OcrService::captureAndRecognizeText() {
-    std::cout << "\n[macOS SNIPPING TOOL] Selecteaza zona de pe ecran..." << std::endl;
+    std::cout << "\n[macOS SNIPPING TOOL] Select a region on your screen..." << std::endl;
     std::string tempPath = "./temp_snippet.png";
     
     std::string captureCmd = "screencapture -i " + tempPath;
     int res = std::system(captureCmd.c_str());
 
-    if (res != 0) {
-        std::cerr << "[SNIPPING TOOL] Captura anulata." << std::endl;
+    if (res != 0 || !std::filesystem::exists(tempPath)) {
+        std::cerr << "[SNIPPING TOOL] Screen capture cancelled or failed." << std::endl;
         return "";
     }
 
     std::string text = recognizeTextFromImage(tempPath);
-    std::remove(tempPath.c_str());
+    std::filesystem::remove(tempPath);
     return text;
 }
 

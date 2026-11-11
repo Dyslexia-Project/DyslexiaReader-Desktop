@@ -3,13 +3,23 @@
         {
             "name": "Mac",
             "includePath": [
-                "/opt/homebrew/include"
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/include/dyslexia_reader",
+                "${workspaceFolder}/include/**",
+                "/opt/homebrew/include",
+                "/opt/homebrew/include/leptonica",
+                "/opt/homebrew/include/tesseract",
+                "/opt/homebrew/Cellar/leptonica/1.87.0/include",
+                "/opt/homebrew/Cellar/leptonica/1.87.0/include/leptonica",
+                "/opt/homebrew/Cellar/tesseract/5.5.4/include",
+                "/opt/homebrew/Cellar/tesseract/5.5.4/include/tesseract"
             ],
             "defines": [],
-            "compilerPath": "/usr/bin/clang",
-            "cStandard": "gnu17",
-            "cppStandard": "gnu++17",
-            "intelliSenseMode": "macos-clang-arm64"
+            "compilerPath": "/usr/bin/clang++",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "macos-clang-arm64",
+            "compileCommands": "${workspaceFolder}/build/compile_commands.json"
         }
     ],
     "version": 4
