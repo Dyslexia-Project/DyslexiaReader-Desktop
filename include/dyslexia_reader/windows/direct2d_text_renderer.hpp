@@ -9,6 +9,8 @@
 #include <dwrite_2.h>
 #include <commctrl.h>
 #include <deque>
+#include <functional>
+#include <utility>
 #include <memory>
 #include <mutex>
 #include <wrl/client.h>
@@ -30,6 +32,31 @@ public:
     HWND create_reader_window(HINSTANCE instance, HWND owner = nullptr);
     void show(int showCommand);
     HWND hwnd() const noexcept { return hwnd_; }
+    void set_mode(ReaderMode mode);
+    ReaderMode mode() const noexcept { return mode_; }
+    void set_hide_on_close(bool hideOnClose) noexcept {
+        hideOnClose_ = hideOnClose;
+    }
+    bool is_visible() const noexcept;
+    void set_on_profile_changed(std::function<void(const ReadingProfile&)> cb) {
+        onProfileChanged_ = std::move(cb);
+    }
+    void set_on_mode_changed(std::function<void(ReaderMode)> cb) {
+        onModeChanged_ = std::move(cb);
+    }
+    void set_on_capture_requested(std::function<void()> cb) {
+        onCaptureRequested_ = std::move(cb);
+        if (captureButton_ != nullptr) {
+            EnableWindow(captureButton_, onCaptureRequested_ ? TRUE : FALSE);
+        }
+    }
+    void set_on_clipboard_requested(std::function<void()> cb) {
+        onClipboardRequested_ = std::move(cb);
+        if (clipboardButton_ != nullptr) {
+            EnableWindow(clipboardButton_,
+                         onClipboardRequested_ ? TRUE : FALSE);
+        }
+    }
 
     void set_document(const ReadingDocument& document) override;
     void set_profile(const ReadingProfile& profile) override;
@@ -38,6 +65,7 @@ public:
     void set_aid_visuals(const AidVisuals& visuals) override;
     void set_highlights(const HighlightState& highlights) override;
     void invalidate() override;
+    std::optional<TextRange> selected_word() const noexcept;
 
 private:
     static LRESULT CALLBACK window_proc(HWND window, UINT message,
@@ -49,7 +77,15 @@ private:
 
     void ensure_render_target();
     void create_toolbar_controls();
+    static LRESULT CALLBACK canvas_window_proc(HWND window, UINT message,
+                                               WPARAM wParam, LPARAM lParam);
+    LRESULT handle_canvas_message(UINT message, WPARAM wParam, LPARAM lParam);
+    void create_canvas_window();
     void layout_toolbar_controls();
+    void layout_canvas_window();
+    void paint_toolbar(HDC hdc, const RECT& dirtyRect) const;
+    bool handle_navigation_key(WPARAM key);
+    void handle_mouse_wheel(WPARAM wParam);
     void sync_toolbar_controls();
     void handle_command(int controlId, int notificationCode);
     void handle_horizontal_scroll(HWND control);
@@ -64,6 +100,14 @@ private:
     void select_ruler_line_at(int pixelY);
     void move_ruler_line(int direction);
     bool handle_ruler_key(WPARAM key);
+    bool select_word_at_point(int pixelX, int pixelY);
+    void move_word_cursor(int wordDelta);
+    void move_word_cursor_line(int lineDelta);
+    void clear_word_cursor();
+    void start_speech_request(std::optional<TextRange> selection);
+    void speak_selected_word();
+    void sync_ruler_to_word();
+    void draw_word_cursor(bool underText) const;
     void rebuild_text_layout();
     void discard_device_resources() noexcept;
     void paint();
@@ -72,8 +116,10 @@ private:
 
     static constexpr wchar_t kWindowClassName[] =
         L"DyslexiaReader.Direct2DReaderWindow";
-    static constexpr float kToolbarHeightDip = 156;
-    static constexpr float kTextPaddingDip = 24;
+    static constexpr wchar_t kCanvasClassName[] =
+        L"DyslexiaReader.Direct2DCanvasWindow";
+    static constexpr float kToolbarHeightDip = 128;
+    static constexpr float kTextPaddingDip = 28;
     static constexpr int kFontFamilyControlId = 1001;
     static constexpr int kFontSizeDecreaseControlId = 1002;
     static constexpr int kFontSizeIncreaseControlId = 1003;
@@ -87,6 +133,11 @@ private:
     static constexpr int kSpeechPlayControlId = 1010;
     static constexpr int kSpeechStopControlId = 1011;
     static constexpr int kSpeechRateControlId = 1012;
+    static constexpr int kFocusModeControlId = 1014;
+    static constexpr int kCaptureControlId = 1015;
+    static constexpr int kLineWidthControlId = 1016;
+    static constexpr int kClipboardControlId = 1017;
+    static constexpr int kSpeakWordControlId = 1018;
     static constexpr UINT kSpeechEventMessage = WM_APP + 0x31;
 
     struct SpeechDispatchState {
@@ -102,6 +153,7 @@ private:
 
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
+    HWND canvasHwnd_ = nullptr;
     DWORD uiThreadId_ = 0;
     UINT dpiX_ = USER_DEFAULT_SCREEN_DPI;
     UINT dpiY_ = USER_DEFAULT_SCREEN_DPI;
@@ -134,6 +186,8 @@ private:
     bool speechAvailable_ = false;
     std::optional<std::uint32_t> activeVisualLine_;
     std::optional<TextOffset> rulerAnchorOffset_;
+    std::optional<std::size_t> selectedWordIndex_;
+    float cursorTargetCenterX_ = -1.0F;
 
     HWND fontFamilyCombo_ = nullptr;
     HWND fontFamilyLabel_ = nullptr;
@@ -145,7 +199,6 @@ private:
     HWND letterSpacingTrackbar_ = nullptr;
     HWND letterSpacingLabel_ = nullptr;
     HWND lineHeightTrackbar_ = nullptr;
-    HWND lineHeightCaption_ = nullptr;
     HWND lineHeightLabel_ = nullptr;
     HWND bionicReadingCheckBox_ = nullptr;
     HWND readingRulerCheckBox_ = nullptr;
@@ -154,9 +207,44 @@ private:
     HWND speechVoiceCombo_ = nullptr;
     HWND speechPlayButton_ = nullptr;
     HWND speechStopButton_ = nullptr;
-    HWND speechRateCaption_ = nullptr;
+    HWND speakWordButton_ = nullptr;
     HWND speechRateTrackbar_ = nullptr;
     HWND speechRateLabel_ = nullptr;
+    HWND focusModeButton_ = nullptr;
+    HWND captureButton_ = nullptr;
+    HWND clipboardButton_ = nullptr;
+    HWND lineWidthTrackbar_ = nullptr;
+    HWND lineWidthLabel_ = nullptr;
+    HWND shortcutHintLabel_ = nullptr;
+
+    HFONT uiFont_ = nullptr;
+    HBRUSH toolbarBrush_ = nullptr;
+    ThemeId themedBrushId_ = ThemeId::WarmCream;
+    bool hasThemedBrush_ = false;
+    bool hasAppliedWindowTheme_ = false;
+    ThemeId appliedWindowThemeId_ = ThemeId::WarmCream;
+
+    ReaderMode mode_ = ReaderMode::Floating;
+    bool hideOnClose_ = false;
+    bool hasFloatingBounds_ = false;
+    RECT floatingBounds_{};
+    std::function<void(const ReadingProfile&)> onProfileChanged_;
+    std::function<void(ReaderMode)> onModeChanged_;
+    std::function<void()> onCaptureRequested_;
+    std::function<void()> onClipboardRequested_;
+
+    std::pair<float, float> text_column_metrics() const;
+    float content_height_dip() const;
+    float max_scroll_y() const;
+    void set_scroll_y(float scrollY);
+    void scroll_by_delta(float deltaDip);
+    void sync_scrollbar() const;
+    void commit_ui_profile(const ReadingProfile& nextProfile);
+    void apply_window_mode();
+    void update_focus_scroll(TextRange range);
+    void rebuild_ui_font();
+    void update_theme_resources();
+    void destroy_theme_resources() noexcept;
 };
 
 }  // namespace dyslexia_reader::windows

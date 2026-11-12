@@ -1,8 +1,10 @@
 {
   "name": "dyslexia-reader-desktop",
   "version-string": "1.0.0",
+  "builtin-baseline": "2ec0f1747d8186a5c9babe276e2ad57cd2b12d2a",
   "dependencies": [
     "tesseract",
-    "leptonica"
+    "leptonica",
+    "nlohmann-json"
   ]
 }

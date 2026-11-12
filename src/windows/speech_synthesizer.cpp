@@ -1,14 +1,17 @@
 #include "dyslexia_reader/windows/speech_synthesizer.hpp"
 
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Media.Core.h>
 #include <winrt/Windows.Media.Playback.h>
 #include <winrt/Windows.Media.SpeechSynthesis.h>
+#include <winrt/Windows.Storage.Streams.h>
 #include <winrt/base.h>
 #include <windows.h>
 
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -284,7 +287,8 @@ private:
             }
 
             const auto input = winrt::hstring(
-                reinterpret_cast<const wchar_t*>(text.data()), text.size());
+                reinterpret_cast<const wchar_t*>(text.data()),
+                static_cast<winrt::hstring::size_type>(text.size()));
             auto operation = synthesizer.SynthesizeTextToStreamAsync(input);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -393,9 +397,19 @@ private:
                                 return;
                             }
 
-                            const auto start = cue.StartPositionInInput();
-                            const auto end = cue.EndPositionInInput();
-                            if (end < start || end > inputLength ||
+                            const auto startRef = cue.StartPositionInInput();
+                            const auto endRef = cue.EndPositionInInput();
+                            if (!startRef || !endRef) {
+                                return;
+                            }
+                            const std::int32_t startValue = startRef.Value();
+                            const std::int32_t endValue = endRef.Value();
+                            if (startValue < 0 || endValue < startValue) {
+                                return;
+                            }
+                            const auto start = static_cast<TextOffset>(startValue);
+                            const auto end = static_cast<TextOffset>(endValue);
+                            if (end > inputLength ||
                                 end > std::numeric_limits<TextOffset>::max() -
                                           baseOffset) {
                                 return;
@@ -417,7 +431,7 @@ private:
                         });
                     playbackItem.TimedMetadataTracks().SetPresentationMode(
                         index,
-                        winrt::Windows::Media::Core::
+                        winrt::Windows::Media::Playback::
                             TimedMetadataTrackPresentationMode::
                                 ApplicationPresented);
                 }

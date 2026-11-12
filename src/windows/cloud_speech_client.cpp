@@ -4,6 +4,7 @@
 #include <wincrypt.h>
 #include <winhttp.h>
 #include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/base.h>
 
 #include <cmath>
@@ -169,12 +170,12 @@ std::string request_json(const std::u16string& text,
     using namespace winrt::Windows::Data::Json;
 
     JsonObject body;
-    body.Insert(L"text", JsonValue::CreateString(to_hstring(text)));
+    body.Insert(L"text", JsonValue::CreateStringValue(to_hstring(text)));
     body.Insert(L"voiceId",
-                JsonValue::CreateString(winrt::to_hstring(voiceId)));
-    body.Insert(L"rate", JsonValue::CreateNumber(static_cast<double>(rate)));
-    body.Insert(L"includeAudio", JsonValue::CreateBoolean(true));
-    body.Insert(L"includeSpeechMarks", JsonValue::CreateBoolean(true));
+                JsonValue::CreateStringValue(winrt::to_hstring(voiceId)));
+    body.Insert(L"rate", JsonValue::CreateNumberValue(static_cast<double>(rate)));
+    body.Insert(L"includeAudio", JsonValue::CreateBooleanValue(true));
+    body.Insert(L"includeSpeechMarks", JsonValue::CreateBooleanValue(true));
     return winrt::to_string(body.Stringify());
 }
 

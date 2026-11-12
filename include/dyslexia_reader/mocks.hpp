@@ -40,12 +40,12 @@ public:
     ReadingDocument rebuild(const OcrResult&) override {
         ReadingDocument document;
         document.text = u"comprehension improves focus.";
-        document.paragraphs = {{0, 28}};
-        document.sentences = {{0, 28}};
+        document.paragraphs = {{0, 29}};
+        document.sentences = {{0, 29}};
         document.words = {
             {{0, 13}, {10, 10, 75, 38}},
             {{14, 8}, {92, 30, 78, 18}},
-            {{23, 5}, {180, 30, 40, 18}}};
+            {{23, 6}, {180, 30, 40, 18}}};
         return document;
     }
 };

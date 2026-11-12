@@ -3,4 +3,7 @@
 
 # macOS system files
 .DS_Store
+
+# CMake / IDE build artifacts
 build/
+cmake-build-*/

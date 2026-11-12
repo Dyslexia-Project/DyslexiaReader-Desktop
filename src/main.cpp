@@ -1,4 +1,5 @@
 #include "dyslexia_reader/ocr_service.hpp"
+#include "ocr_build_paths.hpp"
 
 #include <filesystem>
 #include <iostream>
@@ -22,14 +23,16 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Path to image (if not provided as an argument, look for test.png)
     std::string imagePath;
+    const auto sourceTestPng = std::filesystem::path(kProjectSourceDir) / "test.png";
     if (argc > 1) {
         imagePath = argv[1];
     } else if (std::filesystem::exists("test.png")) {
         imagePath = "test.png";
     } else if (std::filesystem::exists("../test.png")) {
         imagePath = "../test.png";
+    } else if (std::filesystem::exists(sourceTestPng)) {
+        imagePath = sourceTestPng.string();
     } else {
         imagePath = "test.png";
     }
@@ -39,7 +42,6 @@ int main(int argc, char* argv[]) {
     std::string extractedText = ocrService.recognizeTextFromImage(imagePath);
     if (extractedText.empty()) {
         std::cerr << "[ERROR] Could not open or process image: " << imagePath << std::endl;
-        std::cerr << "Tip: Take a screenshot using 'Cmd + Shift + 4' and save it as 'test.png'!" << std::endl;
         return 1;
     }
 

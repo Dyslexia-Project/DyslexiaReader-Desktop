@@ -1,0 +1,4 @@
+#pragma once
+
+inline constexpr const char* kBuildTessdataDir = "@CMAKE_BINARY_DIR@/tessdata";
+inline constexpr const char* kProjectSourceDir = "@CMAKE_CURRENT_SOURCE_DIR@";

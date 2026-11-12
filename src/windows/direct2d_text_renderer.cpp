@@ -106,6 +106,56 @@ D2D1_COLOR_F color_from_rgba(std::uint32_t value) {
         static_cast<float>(value & 0xFF) * scale);
 }
 
+COLORREF colorref_from_hex(std::string_view value) {
+    if (value.size() != 7 || value.front() != '#') {
+        return RGB(250, 246, 238);
+    }
+    const auto channel = [&value](std::size_t offset) -> BYTE {
+        return static_cast<BYTE>(hex_digit(value[offset]) * 16U +
+                                 hex_digit(value[offset + 1]));
+    };
+    return RGB(channel(1), channel(3), channel(5));
+}
+
+void try_set_window_theme(HWND target, const wchar_t* appName,
+                          const wchar_t* subIdList) {
+    if (target == nullptr) {
+        return;
+    }
+    using SetWindowThemeFn = HRESULT(WINAPI*)(HWND, LPCWSTR, LPCWSTR);
+    static const SetWindowThemeFn setWindowTheme = []() -> SetWindowThemeFn {
+        HMODULE uxtheme = LoadLibraryW(L"uxtheme.dll");
+        if (uxtheme == nullptr) {
+            return nullptr;
+        }
+        return reinterpret_cast<SetWindowThemeFn>(
+            GetProcAddress(uxtheme, "SetWindowTheme"));
+    }();
+    if (setWindowTheme != nullptr) {
+        setWindowTheme(target, appName, subIdList);
+    }
+}
+
+void try_set_immersive_dark_titlebar(HWND hwnd, bool enabled) {
+    if (hwnd == nullptr) {
+        return;
+    }
+    using DwmSetAttrFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    static const DwmSetAttrFn dwmSetAttr = []() -> DwmSetAttrFn {
+        HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+        if (dwm == nullptr) {
+            return nullptr;
+        }
+        return reinterpret_cast<DwmSetAttrFn>(
+            GetProcAddress(dwm, "DwmSetWindowAttribute"));
+    }();
+    if (dwmSetAttr != nullptr) {
+        constexpr DWORD kDwmwaUseImmersiveDarkMode = 20;
+        const BOOL value = enabled ? TRUE : FALSE;
+        dwmSetAttr(hwnd, kDwmwaUseImmersiveDarkMode, &value, sizeof(value));
+    }
+}
+
 const wchar_t* font_family_label(FontFamily family) {
     switch (family) {
     case FontFamily::Lexend:
@@ -179,6 +229,7 @@ Direct2DTextRenderer::~Direct2DTextRenderer() {
     if (hwnd_ != nullptr && IsWindow(hwnd_)) {
         DestroyWindow(hwnd_);
     }
+    destroy_theme_resources();
 }
 
 HWND Direct2DTextRenderer::create_reader_window(HINSTANCE instance,
@@ -207,15 +258,218 @@ HWND Direct2DTextRenderer::create_reader_window(HINSTANCE instance,
             "Could not register the Direct2D reader window class");
     }
 
+    WNDCLASSEXW canvasClass{};
+    canvasClass.cbSize = sizeof(canvasClass);
+    canvasClass.style = CS_DBLCLKS;
+    canvasClass.hInstance = instance_;
+    canvasClass.lpfnWndProc = &Direct2DTextRenderer::canvas_window_proc;
+    canvasClass.lpszClassName = kCanvasClassName;
+    canvasClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    canvasClass.hbrBackground = nullptr;
+
+    SetLastError(ERROR_SUCCESS);
+    if (RegisterClassExW(&canvasClass) == 0 &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        throw ReaderError(
+            ReaderErrorCode::WindowCreationFailed,
+            "Could not register the Direct2D canvas child window class");
+    }
+
+    RECT workArea{0, 0, 1280, 800};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    UINT systemDpi = GetDpiForSystem();
+    if (systemDpi == 0) {
+        systemDpi = USER_DEFAULT_SCREEN_DPI;
+    }
+    const int workW = std::max<int>(400, workArea.right - workArea.left);
+    const int workH = std::max<int>(320, workArea.bottom - workArea.top);
+    const int desiredW = std::clamp(static_cast<int>(scale_dip(960, systemDpi)),
+                                    std::min(workW, 640), workW - 32);
+    const int desiredH = std::clamp(static_cast<int>(scale_dip(640, systemDpi)),
+                                    std::min(workH, 400), workH - 32);
+    const int posX = workArea.left + (workW - desiredW) / 2;
+    const int posY = workArea.top + (workH - desiredH) / 2;
+
     hwnd_ = CreateWindowExW(
-        0, kWindowClassName, L"Dyslexia Reader",
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
-        800, 500, owner, nullptr, instance_, this);
+        WS_EX_TOPMOST, kWindowClassName, L"Dyslexia Reader",
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, posX, posY,
+        desiredW, desiredH, owner, nullptr, instance_, this);
     if (hwnd_ == nullptr) {
         throw ReaderError(ReaderErrorCode::WindowCreationFailed,
                           "Could not create the reader window");
     }
+    if (mode_ == ReaderMode::Focus) {
+        apply_window_mode();
+    }
     return hwnd_;
+}
+
+void Direct2DTextRenderer::commit_ui_profile(const ReadingProfile& nextProfile) {
+    set_profile(nextProfile);
+    if (onProfileChanged_) {
+        onProfileChanged_(profile_);
+    }
+}
+
+bool Direct2DTextRenderer::is_visible() const noexcept {
+    return hwnd_ != nullptr && IsWindowVisible(hwnd_) != FALSE;
+}
+
+std::optional<TextRange> Direct2DTextRenderer::selected_word() const noexcept {
+    if (!selectedWordIndex_.has_value() ||
+        *selectedWordIndex_ >= document_.words.size()) {
+        return std::nullopt;
+    }
+    return document_.words[*selectedWordIndex_].text;
+}
+
+std::pair<float, float> Direct2DTextRenderer::text_column_metrics() const {
+    const float availableWidth =
+        std::max(1.0F, viewport_.size.width - 2.0F * kTextPaddingDip);
+    const float fontPx = dip_from_points(profile_.fontSizePt);
+    const float chAdvance = fontPx * 0.55F;
+    const float targetWidth =
+        chAdvance * static_cast<float>(profile_.lineWidthCh);
+    const float minReasonable = std::min(availableWidth, 240.0F);
+    const float columnWidth =
+        std::clamp(targetWidth, minReasonable, availableWidth);
+    const float originX = kTextPaddingDip +
+                          std::max(0.0F, (availableWidth - columnWidth) * 0.5F);
+    return {originX, columnWidth};
+}
+
+float Direct2DTextRenderer::content_height_dip() const {
+    if (textLayout_ == nullptr) {
+        return 0.0F;
+    }
+    DWRITE_TEXT_METRICS metrics{};
+    if (FAILED(textLayout_->GetMetrics(&metrics))) {
+        return 0.0F;
+    }
+    return metrics.height;
+}
+
+float Direct2DTextRenderer::max_scroll_y() const {
+    const float visibleHeight = std::max(1.0F, viewport_.size.height);
+    const float totalHeight = content_height_dip() + 2.0F * kTextPaddingDip;
+    return std::max(0.0F, totalHeight - visibleHeight);
+}
+
+void Direct2DTextRenderer::sync_scrollbar() const {
+    if (canvasHwnd_ == nullptr) {
+        return;
+    }
+    const float visibleHeight = std::max(1.0F, viewport_.size.height);
+    const float totalHeight = content_height_dip() + 2.0F * kTextPaddingDip;
+    SCROLLINFO si{};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_ALL | SIF_DISABLENOSCROLL;
+    si.nMin = 0;
+    si.nPage = static_cast<UINT>(std::max(1L, std::lround(visibleHeight)));
+    si.nMax = static_cast<int>(
+        std::max<long>(static_cast<long>(si.nPage) - 1,
+                       std::lround(totalHeight) - 1));
+    si.nPos = static_cast<int>(
+        std::clamp<long>(std::lround(viewport_.scrollY), 0,
+                         std::max(0L, static_cast<long>(std::lround(max_scroll_y())))));
+    SetScrollInfo(canvasHwnd_, SB_VERT, &si, TRUE);
+}
+
+void Direct2DTextRenderer::set_scroll_y(float scrollY) {
+    const float clamped = std::clamp(scrollY, 0.0F, max_scroll_y());
+    if (std::abs(clamped - viewport_.scrollY) < 0.25F && clamped == viewport_.scrollY) {
+        return;
+    }
+    viewport_.scrollY = clamped;
+    sync_scrollbar();
+    invalidate();
+}
+
+void Direct2DTextRenderer::scroll_by_delta(float deltaDip) {
+    set_scroll_y(viewport_.scrollY + deltaDip);
+}
+
+void Direct2DTextRenderer::update_focus_scroll(TextRange range) {
+    const auto bounds = text_range_bounds(range);
+    if (bounds.empty()) {
+        return;
+    }
+    const float top = bounds.front().y;
+    const float bottom = bounds.back().y + bounds.back().height;
+    const float visibleHeight = std::max(1.0F, viewport_.size.height);
+    const float viewTop = viewport_.scrollY;
+    const float viewBottom = viewTop + visibleHeight - kTextPaddingDip;
+    if (top < viewTop) {
+        set_scroll_y(std::max(0.0F, top - kTextPaddingDip));
+    } else if (bottom > viewBottom) {
+        set_scroll_y(bottom - visibleHeight + kTextPaddingDip * 2.0F);
+    }
+}
+
+void Direct2DTextRenderer::set_mode(ReaderMode mode) {
+    require_ui_thread();
+    if (mode_ == mode && hwnd_ != nullptr) {
+        return;
+    }
+    if (hwnd_ != nullptr && mode_ == ReaderMode::Floating &&
+        mode == ReaderMode::Focus) {
+        GetWindowRect(hwnd_, &floatingBounds_);
+        hasFloatingBounds_ = true;
+    }
+    mode_ = mode;
+    if (hwnd_ != nullptr) {
+        apply_window_mode();
+        sync_toolbar_controls();
+        rebuild_text_layout();
+        refresh_aid_visuals();
+        refresh_highlight_visuals();
+        invalidate();
+    }
+    if (onModeChanged_) {
+        onModeChanged_(mode_);
+    }
+}
+
+void Direct2DTextRenderer::apply_window_mode() {
+    if (hwnd_ == nullptr) {
+        return;
+    }
+    const DWORD visibleFlag = IsWindowVisible(hwnd_) ? WS_VISIBLE : 0;
+    const DWORD baseFlags = WS_CLIPCHILDREN | visibleFlag;
+    if (mode_ == ReaderMode::Focus) {
+        SetWindowLongPtrW(hwnd_, GWL_STYLE,
+                          static_cast<LONG_PTR>(WS_POPUP | baseFlags));
+        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE,
+                          static_cast<LONG_PTR>(WS_EX_TOPMOST));
+        HMONITOR monitor =
+            MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (monitor != nullptr && GetMonitorInfoW(monitor, &mi)) {
+            SetWindowPos(hwnd_, HWND_TOPMOST, mi.rcMonitor.left,
+                         mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_FRAMECHANGED | SWP_NOACTIVATE);
+        }
+    } else {
+        SetWindowLongPtrW(
+            hwnd_, GWL_STYLE,
+            static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW | baseFlags));
+        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE,
+                          static_cast<LONG_PTR>(WS_EX_TOPMOST));
+        if (hasFloatingBounds_) {
+            SetWindowPos(hwnd_, HWND_TOPMOST, floatingBounds_.left,
+                         floatingBounds_.top,
+                         floatingBounds_.right - floatingBounds_.left,
+                         floatingBounds_.bottom - floatingBounds_.top,
+                         SWP_FRAMECHANGED | SWP_NOACTIVATE);
+        } else {
+            SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED |
+                             SWP_NOACTIVATE);
+        }
+    }
 }
 
 void Direct2DTextRenderer::show(int showCommand) {
@@ -226,23 +480,135 @@ void Direct2DTextRenderer::show(int showCommand) {
     }
     ShowWindow(hwnd_, showCommand);
     UpdateWindow(hwnd_);
+    if (canvasHwnd_ != nullptr) {
+        UpdateWindow(canvasHwnd_);
+    }
 }
 
 void Direct2DTextRenderer::set_document(const ReadingDocument& document) {
     require_ui_thread();
     document_ = document;
+    viewport_.scrollY = 0.0F;
     highlights_ = {};
     activeVisualLine_.reset();
     rulerAnchorOffset_.reset();
+    selectedWordIndex_.reset();
+    cursorTargetCenterX_ = -1.0F;
     rebuild_text_layout();
+    sync_toolbar_controls();
     refresh_aid_visuals();
     invalidate();
+}
+
+void Direct2DTextRenderer::rebuild_ui_font() {
+    const UINT effectiveDpi = dpiY_ == 0 ? USER_DEFAULT_SCREEN_DPI : dpiY_;
+    const int fontHeight = -MulDiv(19, static_cast<int>(effectiveDpi), 144);
+    HFONT nextFont = CreateFontW(
+        fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    if (nextFont == nullptr) {
+        return;
+    }
+    if (hwnd_ != nullptr) {
+        EnumChildWindows(
+            hwnd_,
+            [](HWND child, LPARAM fontParam) -> BOOL {
+                SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(fontParam),
+                             FALSE);
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(nextFont));
+    }
+    if (uiFont_ != nullptr) {
+        DeleteObject(uiFont_);
+    }
+    uiFont_ = nextFont;
+}
+
+void Direct2DTextRenderer::update_theme_resources() {
+    if (!hasThemedBrush_ || themedBrushId_ != profile_.theme) {
+        if (toolbarBrush_ != nullptr) {
+            DeleteObject(toolbarBrush_);
+            toolbarBrush_ = nullptr;
+        }
+        toolbarBrush_ = CreateSolidBrush(
+            colorref_from_hex(theme_tokens(profile_.theme).surface));
+        themedBrushId_ = profile_.theme;
+        hasThemedBrush_ = true;
+    }
+    if (hwnd_ == nullptr) {
+        return;
+    }
+    if (hasAppliedWindowTheme_ && appliedWindowThemeId_ == profile_.theme) {
+        return;
+    }
+
+    const bool themeChanged = hasAppliedWindowTheme_;
+    const bool isDark = profile_.theme == ThemeId::DarkHighContrast;
+    try_set_immersive_dark_titlebar(hwnd_, isDark);
+    try_set_window_theme(hwnd_, isDark ? L"DarkMode_Explorer" : L"Explorer",
+                         nullptr);
+    if (canvasHwnd_ != nullptr) {
+        try_set_window_theme(
+            canvasHwnd_, isDark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    }
+
+    for (HWND btn : {captureButton_, clipboardButton_, focusModeButton_,
+                     decreaseFontButton_, increaseFontButton_,
+                     speechPlayButton_, speakWordButton_, speechStopButton_}) {
+        try_set_window_theme(btn, isDark ? L"DarkMode_Explorer" : L"Explorer",
+                             nullptr);
+    }
+    for (HWND combo : {fontFamilyCombo_, themeCombo_, speechVoiceCombo_}) {
+        try_set_window_theme(combo, isDark ? L"DarkMode_CFD" : L"Explorer",
+                             nullptr);
+    }
+    for (HWND chk : {bionicReadingCheckBox_, readingRulerCheckBox_,
+                     bimodalHighlightingCheckBox_}) {
+        try_set_window_theme(chk, isDark ? L"" : L"Explorer",
+                             isDark ? L"" : nullptr);
+    }
+    for (HWND slider : {letterSpacingTrackbar_, lineHeightTrackbar_,
+                        lineWidthTrackbar_, speechRateTrackbar_}) {
+        try_set_window_theme(slider, L"Explorer", nullptr);
+    }
+
+    hasAppliedWindowTheme_ = true;
+    appliedWindowThemeId_ = profile_.theme;
+
+    if (themeChanged) {
+        EnumChildWindows(
+            hwnd_,
+            [](HWND child, LPARAM canvasParam) -> BOOL {
+                if (child != reinterpret_cast<HWND>(canvasParam)) {
+                    InvalidateRect(child, nullptr, TRUE);
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(canvasHwnd_));
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+void Direct2DTextRenderer::destroy_theme_resources() noexcept {
+    if (uiFont_ != nullptr) {
+        DeleteObject(uiFont_);
+        uiFont_ = nullptr;
+    }
+    if (toolbarBrush_ != nullptr) {
+        DeleteObject(toolbarBrush_);
+        toolbarBrush_ = nullptr;
+    }
+    hasThemedBrush_ = false;
+    hasAppliedWindowTheme_ = false;
 }
 
 void Direct2DTextRenderer::set_profile(const ReadingProfile& profile) {
     require_ui_thread();
     validate_profile(profile);
     profile_ = profile;
+    update_theme_resources();
     rebuild_text_layout();
     sync_toolbar_controls();
     refresh_aid_visuals();
@@ -302,11 +668,11 @@ TextLayoutSnapshot Direct2DTextRenderer::line_layout_snapshot() const {
         for (const auto& metric : metrics) {
             const UINT32 visibleLength =
                 metric.length - metric.newlineLength;
+            const auto [colOriginX, colWidth] = text_column_metrics();
             snapshot.lines.push_back(
                 {{textStart, visibleLength},
-                 {kTextPaddingDip, kToolbarHeightDip + kTextPaddingDip + y,
-                  std::max(0.0F,
-                           viewport_.size.width - 2 * kTextPaddingDip),
+                 {colOriginX, kTextPaddingDip + y,
+                  colWidth,
                   metric.height}});
             textStart += metric.length;
             y += metric.height;
@@ -326,8 +692,8 @@ std::vector<RectF> Direct2DTextRenderer::text_range_bounds(
 
     UINT32 hitCount = 0;
     const HRESULT countResult = textLayout_->HitTestTextRange(
-        range.start, range.length, kTextPaddingDip,
-        kToolbarHeightDip + kTextPaddingDip - viewport_.scrollY, nullptr, 0,
+        range.start, range.length, text_column_metrics().first,
+        kTextPaddingDip - viewport_.scrollY, nullptr, 0,
         &hitCount);
     if (countResult != E_NOT_SUFFICIENT_BUFFER && FAILED(countResult)) {
         check_hresult(countResult, "IDWriteTextLayout::HitTestTextRange");
@@ -336,11 +702,10 @@ std::vector<RectF> Direct2DTextRenderer::text_range_bounds(
         return bounds;
     }
 
-    std::vector<DWRITE_HIT_TEST_METRIC> hits(hitCount);
+    std::vector<DWRITE_HIT_TEST_METRICS> hits(hitCount);
     check_hresult(textLayout_->HitTestTextRange(
-                      range.start, range.length, kTextPaddingDip,
-                      kToolbarHeightDip + kTextPaddingDip -
-                          viewport_.scrollY,
+                      range.start, range.length, text_column_metrics().first,
+                      kTextPaddingDip - viewport_.scrollY,
                       hits.data(), hitCount, &hitCount),
                   "IDWriteTextLayout::HitTestTextRange");
     bounds.reserve(hitCount);
@@ -394,7 +759,9 @@ void Direct2DTextRenderer::set_highlights(const HighlightState& highlights) {
 
 void Direct2DTextRenderer::invalidate() {
     require_ui_thread();
-    if (hwnd_ != nullptr) {
+    if (canvasHwnd_ != nullptr) {
+        InvalidateRect(canvasHwnd_, nullptr, FALSE);
+    } else if (hwnd_ != nullptr) {
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 }
@@ -439,6 +806,28 @@ LRESULT CALLBACK Direct2DTextRenderer::toolbar_control_proc(
     UINT_PTR subclassId, DWORD_PTR referenceData) {
     auto* renderer =
         reinterpret_cast<Direct2DTextRenderer*>(referenceData);
+    if (message == WM_MOUSEWHEEL && renderer != nullptr && renderer->hwnd_ != nullptr) {
+        if (SendMessageW(control, CB_GETDROPPEDSTATE, 0, 0) == 0) {
+            SendMessageW(renderer->hwnd_, WM_MOUSEWHEEL, wParam, lParam);
+            return 0;
+        }
+    }
+    if (message == WM_KEYDOWN && renderer != nullptr && renderer->hwnd_ != nullptr) {
+        const bool isFocusEscape =
+            (wParam == VK_ESCAPE && renderer->mode() == ReaderMode::Focus);
+        const bool isPageOrEdgeKey =
+            (wParam == VK_PRIOR || wParam == VK_NEXT || wParam == VK_HOME ||
+             wParam == VK_END) &&
+            control != renderer->letterSpacingTrackbar_ &&
+            control != renderer->lineHeightTrackbar_ &&
+            control != renderer->lineWidthTrackbar_ &&
+            control != renderer->speechRateTrackbar_ &&
+            SendMessageW(control, CB_GETDROPPEDSTATE, 0, 0) == 0;
+        if (isFocusEscape || isPageOrEdgeKey) {
+            SendMessageW(renderer->hwnd_, WM_KEYDOWN, wParam, lParam);
+            return 0;
+        }
+    }
     if (message == WM_SYSKEYDOWN && renderer != nullptr) {
         try {
             if (renderer->handle_ruler_key(wParam)) {
@@ -457,20 +846,323 @@ LRESULT CALLBACK Direct2DTextRenderer::toolbar_control_proc(
     return DefSubclassProc(control, message, wParam, lParam);
 }
 
+LRESULT CALLBACK Direct2DTextRenderer::canvas_window_proc(HWND window,
+                                                          UINT message,
+                                                          WPARAM wParam,
+                                                          LPARAM lParam) {
+    auto* renderer = reinterpret_cast<Direct2DTextRenderer*>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        renderer = static_cast<Direct2DTextRenderer*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(renderer));
+        renderer->canvasHwnd_ = window;
+    }
+
+    if (renderer != nullptr) {
+        LRESULT result = 0;
+        try {
+            result = renderer->handle_canvas_message(message, wParam, lParam);
+        } catch (const std::exception& error) {
+            log_window_error(error);
+            result = message == WM_CREATE ? -1 : 0;
+        }
+        if (message == WM_NCDESTROY) {
+            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            renderer->canvasHwnd_ = nullptr;
+        }
+        return result;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void Direct2DTextRenderer::create_canvas_window() {
+    canvasHwnd_ = CreateWindowExW(
+        0, kCanvasClassName, L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPSIBLINGS,
+        0, 0, 1, 1, hwnd_, nullptr, instance_, this);
+    if (canvasHwnd_ == nullptr) {
+        throw ReaderError(ReaderErrorCode::WindowCreationFailed,
+                          "Could not create the Direct2D canvas window");
+    }
+}
+
+void Direct2DTextRenderer::layout_canvas_window() {
+    if (hwnd_ == nullptr || canvasHwnd_ == nullptr) {
+        return;
+    }
+    RECT client{};
+    if (!GetClientRect(hwnd_, &client)) {
+        return;
+    }
+    const int toolbarPx = static_cast<int>(scale_dip(kToolbarHeightDip, dpiY_));
+    const int width = std::max(0L, client.right - client.left);
+    const int height = std::max(0L, client.bottom - client.top - toolbarPx);
+    SetWindowPos(canvasHwnd_, nullptr, 0, toolbarPx, width, height,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void Direct2DTextRenderer::paint_toolbar(HDC hdc,
+                                         const RECT& dirtyRect) const {
+    if (hwnd_ == nullptr) {
+        return;
+    }
+    RECT client{};
+    if (!GetClientRect(hwnd_, &client)) {
+        return;
+    }
+    const auto& tokens = theme_tokens(profile_.theme);
+    if (toolbarBrush_ != nullptr) {
+        FillRect(hdc, &dirtyRect, toolbarBrush_);
+    } else {
+        HBRUSH fallback = CreateSolidBrush(colorref_from_hex(tokens.surface));
+        if (fallback != nullptr) {
+            FillRect(hdc, &dirtyRect, fallback);
+            DeleteObject(fallback);
+        }
+    }
+    const int toolbarPx = static_cast<int>(scale_dip(kToolbarHeightDip, dpiY_));
+    if (toolbarPx <= 1) {
+        return;
+    }
+    HPEN borderPen = CreatePen(PS_SOLID, 1, colorref_from_hex(tokens.border));
+    if (borderPen == nullptr) {
+        return;
+    }
+    HGDIOBJ oldPen = SelectObject(hdc, borderPen);
+    MoveToEx(hdc, 0, toolbarPx - 1, nullptr);
+    LineTo(hdc, client.right, toolbarPx - 1);
+    const int div1X = static_cast<int>(scale_dip(329, dpiX_));
+    MoveToEx(hdc, div1X, static_cast<int>(scale_dip(12, dpiY_)), nullptr);
+    LineTo(hdc, div1X, static_cast<int>(scale_dip(36, dpiY_)));
+    const int div2X = static_cast<int>(scale_dip(552, dpiX_));
+    MoveToEx(hdc, div2X, static_cast<int>(scale_dip(50, dpiY_)), nullptr);
+    LineTo(hdc, div2X, static_cast<int>(scale_dip(72, dpiY_)));
+    SelectObject(hdc, oldPen);
+    DeleteObject(borderPen);
+}
+
+void Direct2DTextRenderer::handle_mouse_wheel(WPARAM wParam) {
+    const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+    if (delta != 0) {
+        const float stepDip =
+            dip_from_points(profile_.fontSizePt) * profile_.lineHeight * 2.5F;
+        scroll_by_delta(-static_cast<float>(delta) / WHEEL_DELTA * stepDip);
+    }
+}
+
+bool Direct2DTextRenderer::handle_navigation_key(WPARAM key) {
+    const float lineStep =
+        dip_from_points(profile_.fontSizePt) * profile_.lineHeight;
+    const float pageStep = std::max(lineStep, viewport_.size.height * 0.85F);
+    switch (key) {
+    case VK_ESCAPE:
+        if (mode_ == ReaderMode::Focus) {
+            set_mode(ReaderMode::Floating);
+            return true;
+        }
+        if (selectedWordIndex_.has_value()) {
+            clear_word_cursor();
+            return true;
+        }
+        return false;
+    case VK_PRIOR:
+        scroll_by_delta(-pageStep);
+        return true;
+    case VK_NEXT:
+        scroll_by_delta(pageStep);
+        return true;
+    case VK_HOME:
+        set_scroll_y(0.0F);
+        return true;
+    case VK_END:
+        set_scroll_y(max_scroll_y());
+        return true;
+    case VK_LEFT:
+        move_word_cursor(-1);
+        return true;
+    case VK_RIGHT:
+        move_word_cursor(1);
+        return true;
+    case VK_UP:
+        if (selectedWordIndex_.has_value()) {
+            move_word_cursor_line(-1);
+        } else {
+            scroll_by_delta(-lineStep);
+        }
+        return true;
+    case VK_DOWN:
+        if (selectedWordIndex_.has_value()) {
+            move_word_cursor_line(1);
+        } else {
+            scroll_by_delta(lineStep);
+        }
+        return true;
+    case VK_RETURN:
+        if (selectedWordIndex_.has_value()) {
+            speak_selected_word();
+            return true;
+        }
+        return false;
+    case VK_SPACE:
+        if (speechAvailable_ && speechEngine_ != nullptr) {
+            handle_speech_command(kSpeechPlayControlId);
+            return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+LRESULT Direct2DTextRenderer::handle_canvas_message(UINT message, WPARAM wParam,
+                                                    LPARAM lParam) {
+    switch (message) {
+    case WM_PAINT: {
+        PAINTSTRUCT paintStruct{};
+        BeginPaint(canvasHwnd_, &paintStruct);
+        struct PaintScope {
+            HWND window;
+            PAINTSTRUCT& state;
+            ~PaintScope() { EndPaint(window, &state); }
+        } paintScope{canvasHwnd_, paintStruct};
+        paint();
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        if (renderTarget_ != nullptr) {
+            const UINT width = LOWORD(lParam);
+            const UINT height = HIWORD(lParam);
+            if (width > 0 && height > 0) {
+                const HRESULT result =
+                    renderTarget_->Resize(D2D1::SizeU(width, height));
+                if (FAILED(result)) {
+                    discard_device_resources();
+                }
+            }
+        }
+        if (canvasHwnd_ != nullptr) {
+            InvalidateRect(canvasHwnd_, nullptr, FALSE);
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        handle_mouse_wheel(wParam);
+        return 0;
+    case WM_VSCROLL: {
+        SCROLLINFO si{};
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL;
+        if (!GetScrollInfo(canvasHwnd_, SB_VERT, &si)) {
+            return 0;
+        }
+        const float lineStep =
+            dip_from_points(profile_.fontSizePt) * profile_.lineHeight;
+        const float pageStep = std::max(lineStep, viewport_.size.height * 0.85F);
+        switch (LOWORD(wParam)) {
+        case SB_LINEUP:
+            scroll_by_delta(-lineStep);
+            break;
+        case SB_LINEDOWN:
+            scroll_by_delta(lineStep);
+            break;
+        case SB_PAGEUP:
+            scroll_by_delta(-pageStep);
+            break;
+        case SB_PAGEDOWN:
+            scroll_by_delta(pageStep);
+            break;
+        case SB_TOP:
+            set_scroll_y(0.0F);
+            break;
+        case SB_BOTTOM:
+            set_scroll_y(max_scroll_y());
+            break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION:
+            set_scroll_y(static_cast<float>(si.nTrackPos));
+            break;
+        default:
+            break;
+        }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        SetFocus(canvasHwnd_);
+        const int clickX = static_cast<int>(static_cast<SHORT>(LOWORD(lParam)));
+        const int clickY = static_cast<int>(static_cast<SHORT>(HIWORD(lParam)));
+        const bool pickedWord = select_word_at_point(clickX, clickY);
+        if (profile_.aids.readingRuler) {
+            if (!pickedWord) {
+                select_ruler_line_at(clickY);
+            }
+            SetCapture(canvasHwnd_);
+        }
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK: {
+        SetFocus(canvasHwnd_);
+        const int clickX = static_cast<int>(static_cast<SHORT>(LOWORD(lParam)));
+        const int clickY = static_cast<int>(static_cast<SHORT>(HIWORD(lParam)));
+        if (select_word_at_point(clickX, clickY)) {
+            speak_selected_word();
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (profile_.aids.readingRuler && GetCapture() == canvasHwnd_ &&
+            (wParam & MK_LBUTTON) != 0) {
+            select_ruler_line_at(
+                static_cast<int>(static_cast<SHORT>(HIWORD(lParam))));
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (GetCapture() == canvasHwnd_) {
+            ReleaseCapture();
+            return 0;
+        }
+        break;
+    case WM_KEYDOWN:
+        if (handle_navigation_key(wParam)) {
+            return 0;
+        }
+        break;
+    case WM_SYSKEYDOWN:
+        if (handle_ruler_key(wParam)) {
+            return 0;
+        }
+        break;
+    case WM_NCDESTROY:
+        discard_device_resources();
+        return DefWindowProcW(canvasHwnd_, message, wParam, lParam);
+    default:
+        return DefWindowProcW(canvasHwnd_, message, wParam, lParam);
+    }
+    return DefWindowProcW(canvasHwnd_, message, wParam, lParam);
+}
+
 LRESULT Direct2DTextRenderer::handle_message(UINT message, WPARAM wParam,
                                             LPARAM lParam) {
     switch (message) {
     case WM_PAINT: {
         PAINTSTRUCT paintStruct{};
-        BeginPaint(hwnd_, &paintStruct);
-        struct PaintScope {
-            HWND window;
-            PAINTSTRUCT& state;
-            ~PaintScope() { EndPaint(window, &state); }
-        } paintScope{hwnd_, paintStruct};
-        paint();
+        HDC hdc = BeginPaint(hwnd_, &paintStruct);
+        paint_toolbar(hdc, paintStruct.rcPaint);
+        EndPaint(hwnd_, &paintStruct);
         return 0;
     }
+    case WM_CLOSE:
+        if (hideOnClose_) {
+            show(SW_HIDE);
+            return 0;
+        }
+        break;
+    case WM_MOUSEWHEEL:
+        handle_mouse_wheel(wParam);
+        return 0;
     case WM_DESTROY:
         ++speechSession_;
         if (speechEngine_ != nullptr) {
@@ -498,29 +1190,35 @@ LRESULT Direct2DTextRenderer::handle_message(UINT message, WPARAM wParam,
             std::lock_guard<std::mutex> lock(speechDispatch_->mutex);
             speechDispatch_->window = hwnd_;
         }
+        rebuild_ui_font();
         create_toolbar_controls();
+        create_canvas_window();
+        update_theme_resources();
         layout_toolbar_controls();
         sync_toolbar_controls();
         resize_viewport();
         rebuild_text_layout();
         refresh_aid_visuals();
         return 0;
-    case WM_SIZE:
-        if (renderTarget_ != nullptr) {
-            const UINT width = LOWORD(lParam);
-            const UINT height = HIWORD(lParam);
-            if (width > 0 && height > 0) {
-                const HRESULT result =
-                    renderTarget_->Resize(D2D1::SizeU(width, height));
-                if (FAILED(result)) {
-                    discard_device_resources();
-                }
-            }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        const auto& tokens = theme_tokens(profile_.theme);
+        SetTextColor(hdc, colorref_from_hex(tokens.text));
+        SetBkColor(hdc, colorref_from_hex(tokens.surface));
+        if (toolbarBrush_ != nullptr) {
+            return reinterpret_cast<LRESULT>(toolbarBrush_);
         }
-        layout_toolbar_controls();
-        resize_viewport();
-        rebuild_text_layout();
-        refresh_aid_visuals();
+        return DefWindowProcW(hwnd_, message, wParam, lParam);
+    }
+    case WM_SIZE:
+        if (wParam != SIZE_MINIMIZED) {
+            layout_toolbar_controls();
+            resize_viewport();
+            rebuild_text_layout();
+            refresh_aid_visuals();
+            invalidate();
+        }
         return 0;
     case WM_DPICHANGED: {
         dpiX_ = LOWORD(wParam);
@@ -532,10 +1230,12 @@ LRESULT Direct2DTextRenderer::handle_message(UINT message, WPARAM wParam,
                      suggested->bottom - suggested->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
         discard_device_resources();
+        rebuild_ui_font();
         layout_toolbar_controls();
         resize_viewport();
         rebuild_text_layout();
         refresh_aid_visuals();
+        invalidate();
         return 0;
     }
     case WM_COMMAND:
@@ -557,38 +1257,20 @@ LRESULT Direct2DTextRenderer::handle_message(UINT message, WPARAM wParam,
         }
         return 0;
     }
+    case WM_KEYDOWN:
+        if (handle_navigation_key(wParam)) {
+            return 0;
+        }
+        return DefWindowProcW(hwnd_, message, wParam, lParam);
     case WM_SYSKEYDOWN:
         if (handle_ruler_key(wParam)) {
             return 0;
         }
         return DefWindowProcW(hwnd_, message, wParam, lParam);
-    case WM_LBUTTONDOWN:
-        if (profile_.aids.readingRuler) {
-            SetFocus(hwnd_);
-            select_ruler_line_at(
-                static_cast<int>(static_cast<SHORT>(HIWORD(lParam))));
-            SetCapture(hwnd_);
-            return 0;
-        }
-        break;
-    case WM_MOUSEMOVE:
-        if (profile_.aids.readingRuler && GetCapture() == hwnd_ &&
-            (wParam & MK_LBUTTON) != 0) {
-            select_ruler_line_at(
-                static_cast<int>(static_cast<SHORT>(HIWORD(lParam))));
-            return 0;
-        }
-        break;
-    case WM_LBUTTONUP:
-        if (GetCapture() == hwnd_) {
-            ReleaseCapture();
-            return 0;
-        }
-        break;
     case WM_GETMINMAXINFO: {
         auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
-        limits->ptMinTrackSize.x = static_cast<LONG>(scale_dip(680, dpiX_));
-        limits->ptMinTrackSize.y = static_cast<LONG>(scale_dip(360, dpiY_));
+        limits->ptMinTrackSize.x = static_cast<LONG>(scale_dip(900, dpiX_));
+        limits->ptMinTrackSize.y = static_cast<LONG>(scale_dip(420, dpiY_));
         return 0;
     }
     case WM_ERASEBKGND:
@@ -599,6 +1281,7 @@ LRESULT Direct2DTextRenderer::handle_message(UINT message, WPARAM wParam,
             speechDispatch_->window = nullptr;
         }
         discard_device_resources();
+        destroy_theme_resources();
         return DefWindowProcW(hwnd_, message, wParam, lParam);
     default:
         return DefWindowProcW(hwnd_, message, wParam, lParam);
@@ -625,9 +1308,12 @@ void Direct2DTextRenderer::create_toolbar_controls() {
             throw ReaderError(ReaderErrorCode::WindowCreationFailed,
                               "Could not create a reader typography control");
         }
-        SendMessageW(control, WM_SETFONT,
-                     reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
-                     TRUE);
+        SendMessageW(
+            control, WM_SETFONT,
+            reinterpret_cast<WPARAM>(uiFont_ != nullptr
+                                         ? uiFont_
+                                         : GetStockObject(DEFAULT_GUI_FONT)),
+            TRUE);
         if (!SetWindowSubclass(
                 control, &Direct2DTextRenderer::toolbar_control_proc, 1,
                 reinterpret_cast<DWORD_PTR>(this))) {
@@ -638,39 +1324,54 @@ void Direct2DTextRenderer::create_toolbar_controls() {
         return control;
     };
 
-    fontFamilyLabel_ = create(L"STATIC", L"Font:", SS_LEFT, 0);
+    captureButton_ =
+        create(L"BUTTON", L"Capture Screen", BS_PUSHBUTTON | WS_TABSTOP,
+               kCaptureControlId);
+    clipboardButton_ =
+        create(L"BUTTON", L"Paste Text", BS_PUSHBUTTON | WS_TABSTOP,
+               kClipboardControlId);
+    focusModeButton_ =
+        create(L"BUTTON", L"Focus Mode", BS_PUSHBUTTON | WS_TABSTOP,
+               kFocusModeControlId);
+
+    fontFamilyLabel_ = create(L"STATIC", L"Font:", SS_LEFT | SS_CENTERIMAGE, 0);
     fontFamilyCombo_ =
         create(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
                kFontFamilyControlId);
     decreaseFontButton_ =
         create(L"BUTTON", L"-", BS_PUSHBUTTON | WS_TABSTOP,
                kFontSizeDecreaseControlId);
-    fontSizeLabel_ = create(L"STATIC", L"", SS_CENTER, 0);
+    fontSizeLabel_ = create(L"STATIC", L"", SS_CENTER | SS_CENTERIMAGE, 0);
     increaseFontButton_ =
         create(L"BUTTON", L"+", BS_PUSHBUTTON | WS_TABSTOP,
                kFontSizeIncreaseControlId);
-    themeLabel_ = create(L"STATIC", L"Theme:", SS_LEFT, 0);
+    themeLabel_ = create(L"STATIC", L"Theme:", SS_LEFT | SS_CENTERIMAGE, 0);
     themeCombo_ =
         create(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
                kThemeControlId);
-    letterSpacingLabel_ = create(L"STATIC", L"Letter:", SS_LEFT, 0);
+
+    letterSpacingLabel_ =
+        create(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE, 0);
     letterSpacingTrackbar_ =
         create(TRACKBAR_CLASSW, L"", TBS_NOTICKS | WS_TABSTOP,
                kLetterSpacingControlId);
-    lineHeightCaption_ = create(L"STATIC", L"Line height:", SS_LEFT, 0);
+    lineHeightLabel_ = create(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE, 0);
     lineHeightTrackbar_ =
         create(TRACKBAR_CLASSW, L"", TBS_NOTICKS | WS_TABSTOP,
                kLineHeightControlId);
-    lineHeightLabel_ = create(L"STATIC", L"", SS_LEFT, 0);
+    lineWidthLabel_ = create(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE, 0);
+    lineWidthTrackbar_ =
+        create(TRACKBAR_CLASSW, L"", TBS_NOTICKS | WS_TABSTOP,
+               kLineWidthControlId);
+
     bionicReadingCheckBox_ =
-        create(L"BUTTON", L"Bionic emphasis",
-               BS_AUTOCHECKBOX | WS_TABSTOP, kBionicReadingControlId);
+        create(L"BUTTON", L"Bionic text", BS_AUTOCHECKBOX | WS_TABSTOP,
+               kBionicReadingControlId);
     readingRulerCheckBox_ =
-        create(L"BUTTON", L"Reading ruler",
-               BS_AUTOCHECKBOX | WS_TABSTOP, kReadingRulerControlId);
+        create(L"BUTTON", L"Reading ruler", BS_AUTOCHECKBOX | WS_TABSTOP,
+               kReadingRulerControlId);
     bimodalHighlightingCheckBox_ =
-        create(L"BUTTON", L"Bimodal highlighting",
-               BS_AUTOCHECKBOX | WS_TABSTOP,
+        create(L"BUTTON", L"Word sync", BS_AUTOCHECKBOX | WS_TABSTOP,
                kBimodalHighlightingControlId);
 
     for (const wchar_t* family :
@@ -696,8 +1397,11 @@ void Direct2DTextRenderer::create_toolbar_controls() {
                  MAKELONG(0, 20));
     SendMessageW(lineHeightTrackbar_, TBM_SETRANGE, TRUE,
                  MAKELONG(10, 25));
+    SendMessageW(lineWidthTrackbar_, TBM_SETRANGE, TRUE,
+                 MAKELONG(35, 100));
 
-    speechVoiceLabel_ = create(L"STATIC", L"Voice:", SS_LEFT, 0);
+    speechVoiceLabel_ =
+        create(L"STATIC", L"Voice:", SS_LEFT | SS_CENTERIMAGE, 0);
     speechVoiceCombo_ =
         create(WC_COMBOBOXW, L"",
                CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
@@ -705,14 +1409,21 @@ void Direct2DTextRenderer::create_toolbar_controls() {
     speechPlayButton_ =
         create(L"BUTTON", L"Play", BS_PUSHBUTTON | WS_TABSTOP,
                kSpeechPlayControlId);
+    speakWordButton_ =
+        create(L"BUTTON", L"Speak Word", BS_PUSHBUTTON | WS_TABSTOP,
+               kSpeakWordControlId);
     speechStopButton_ =
         create(L"BUTTON", L"Stop", BS_PUSHBUTTON | WS_TABSTOP,
                kSpeechStopControlId);
-    speechRateCaption_ = create(L"STATIC", L"Speed:", SS_LEFT, 0);
+    speechRateLabel_ = create(L"STATIC", L"Speed: 1.0x",
+                              SS_LEFT | SS_CENTERIMAGE, 0);
     speechRateTrackbar_ =
         create(TRACKBAR_CLASSW, L"", TBS_NOTICKS | WS_TABSTOP,
                kSpeechRateControlId);
-    speechRateLabel_ = create(L"STATIC", L"1.0x", SS_LEFT, 0);
+    shortcutHintLabel_ =
+        create(L"STATIC",
+               L"Click word: cursor  \x2022  Enter: speak  \x2022  Ctrl+Shift+R: capture",
+               SS_RIGHT | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
     SendMessageW(speechRateTrackbar_, TBM_SETRANGE, TRUE,
                  MAKELONG(50, 200));
     SendMessageW(speechRateTrackbar_, TBM_SETPOS, TRUE, 100);
@@ -766,39 +1477,79 @@ void Direct2DTextRenderer::layout_toolbar_controls() {
     if (hwnd_ == nullptr || fontFamilyCombo_ == nullptr) {
         return;
     }
-    const auto move = [this](HWND control, float x, float y, float width,
-                             float height) {
-        if (!MoveWindow(control, static_cast<int>(scale_dip(x, dpiX_)),
-                        static_cast<int>(scale_dip(y, dpiY_)),
-                        static_cast<int>(scale_dip(width, dpiX_)),
-                        static_cast<int>(scale_dip(height, dpiY_)), TRUE)) {
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    const UINT effDpiX = dpiX_ == 0 ? USER_DEFAULT_SCREEN_DPI : dpiX_;
+    const float clientWidthDip = std::max(
+        900.0F,
+        static_cast<float>(client.right - client.left) * 96.0F /
+            static_cast<float>(effDpiX));
+
+    HDWP deferPos = BeginDeferWindowPos(27);
+    const auto move = [this, &deferPos](HWND control, float x, float y,
+                                        float width, float height) {
+        if (control == nullptr) {
+            return;
+        }
+        const int pxX = static_cast<int>(scale_dip(x, dpiX_));
+        const int pxY = static_cast<int>(scale_dip(y, dpiY_));
+        const int pxW = static_cast<int>(scale_dip(width, dpiX_));
+        const int pxH = static_cast<int>(scale_dip(height, dpiY_));
+        if (deferPos != nullptr) {
+            HDWP next = DeferWindowPos(
+                deferPos, control, nullptr, pxX, pxY, pxW, pxH,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            if (next != nullptr) {
+                deferPos = next;
+                return;
+            }
+        }
+        if (!SetWindowPos(control, nullptr, pxX, pxY, pxW, pxH,
+                          SWP_NOZORDER | SWP_NOACTIVATE)) {
             throw ReaderError(ReaderErrorCode::RenderingFailed,
                               "Could not position a reader toolbar control");
         }
     };
 
-    move(fontFamilyLabel_, 12, 12, 42, 24);
-    move(themeLabel_, 376, 12, 52, 24);
-    move(letterSpacingLabel_, 12, 52, 94, 24);
-    move(lineHeightCaption_, 326, 52, 78, 24);
-    move(bionicReadingCheckBox_, 12, 84, 150, 26);
-    move(readingRulerCheckBox_, 180, 84, 150, 26);
-    move(bimodalHighlightingCheckBox_, 350, 84, 190, 26);
-    move(fontFamilyCombo_, 56, 10, 164, 220);
-    move(decreaseFontButton_, 228, 10, 30, 28);
-    move(fontSizeLabel_, 262, 12, 64, 24);
-    move(increaseFontButton_, 332, 10, 30, 28);
-    move(themeCombo_, 430, 10, 200, 220);
-    move(letterSpacingTrackbar_, 110, 48, 170, 28);
-    move(lineHeightTrackbar_, 404, 48, 154, 28);
-    move(lineHeightLabel_, 564, 52, 64, 24);
-    move(speechVoiceLabel_, 12, 122, 42, 24);
-    move(speechVoiceCombo_, 56, 120, 210, 220);
-    move(speechPlayButton_, 274, 120, 70, 28);
-    move(speechStopButton_, 350, 120, 50, 28);
-    move(speechRateCaption_, 412, 122, 42, 24);
-    move(speechRateTrackbar_, 458, 118, 124, 28);
-    move(speechRateLabel_, 590, 122, 44, 24);
+    // Row 1: Primary capture/mode actions + typography & theme.
+    move(captureButton_, 16, 10, 104, 28);
+    move(clipboardButton_, 126, 10, 88, 28);
+    move(focusModeButton_, 220, 10, 98, 28);
+
+    move(fontFamilyLabel_, 342, 12, 36, 24);
+    move(fontFamilyCombo_, 380, 11, 152, 220);
+    move(decreaseFontButton_, 538, 10, 28, 28);
+    move(fontSizeLabel_, 568, 12, 52, 24);
+    move(increaseFontButton_, 622, 10, 28, 28);
+    move(themeLabel_, 662, 12, 46, 24);
+    move(themeCombo_, 710, 11, 156, 220);
+
+    // Row 2: Spacing sliders (Letter, Line, Width) + visual reading aids.
+    move(letterSpacingLabel_, 16, 50, 74, 22);
+    move(letterSpacingTrackbar_, 92, 48, 92, 26);
+    move(lineHeightLabel_, 196, 50, 66, 22);
+    move(lineHeightTrackbar_, 264, 48, 92, 26);
+    move(lineWidthLabel_, 368, 50, 78, 22);
+    move(lineWidthTrackbar_, 448, 48, 92, 26);
+
+    move(bionicReadingCheckBox_, 564, 50, 92, 22);
+    move(readingRulerCheckBox_, 660, 50, 100, 22);
+    move(bimodalHighlightingCheckBox_, 764, 50, 96, 22);
+
+    // Row 3: Offline speech controls + right-aligned shortcut hint.
+    move(speechVoiceLabel_, 16, 88, 40, 24);
+    move(speechVoiceCombo_, 58, 86, 186, 220);
+    move(speechPlayButton_, 252, 86, 68, 28);
+    move(speakWordButton_, 326, 86, 86, 28);
+    move(speechStopButton_, 418, 86, 54, 28);
+    move(speechRateLabel_, 482, 88, 72, 24);
+    move(speechRateTrackbar_, 556, 86, 88, 26);
+    move(shortcutHintLabel_, 654, 90,
+         std::max(120.0F, clientWidthDip - 670.0F), 20);
+    if (deferPos != nullptr) {
+        EndDeferWindowPos(deferPos);
+    }
+    layout_canvas_window();
 }
 
 void Direct2DTextRenderer::sync_toolbar_controls() {
@@ -842,6 +1593,8 @@ void Direct2DTextRenderer::sync_toolbar_controls() {
     SendMessageW(lineHeightTrackbar_, TBM_SETPOS, TRUE,
                  static_cast<LPARAM>(
                      std::lround(profile_.lineHeight * 10.0F)));
+    SendMessageW(lineWidthTrackbar_, TBM_SETPOS, TRUE,
+                 static_cast<LPARAM>(profile_.lineWidthCh));
     SendMessageW(bionicReadingCheckBox_, BM_SETCHECK,
                  profile_.aids.bionicReading ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(readingRulerCheckBox_, BM_SETCHECK,
@@ -858,24 +1611,28 @@ void Direct2DTextRenderer::sync_toolbar_controls() {
                           "Could not update the font size label");
     }
     std::wostringstream letterText;
-    letterText << std::fixed << std::setprecision(2)
+    letterText << L"Letter: " << std::fixed << std::setprecision(2)
                << profile_.letterSpacingEm;
-    if (!SetWindowTextW(letterSpacingLabel_,
-                        (L"Letter: " + letterText.str()).c_str())) {
+    if (!SetWindowTextW(letterSpacingLabel_, letterText.str().c_str())) {
         throw ReaderError(ReaderErrorCode::RenderingFailed,
                           "Could not update the letter spacing label");
     }
     std::wostringstream lineText;
-    lineText << std::fixed << std::setprecision(1) << profile_.lineHeight
-             << L"x";
+    lineText << L"Line: " << std::fixed << std::setprecision(1)
+             << profile_.lineHeight << L"x";
     if (!SetWindowTextW(lineHeightLabel_, lineText.str().c_str())) {
         throw ReaderError(ReaderErrorCode::RenderingFailed,
                           "Could not update the line height label");
     }
+    std::wostringstream widthText;
+    widthText << L"Width: " << profile_.lineWidthCh << L"ch";
+    SetWindowTextW(lineWidthLabel_, widthText.str().c_str());
+
     SendMessageW(speechRateTrackbar_, TBM_SETPOS, TRUE,
                  static_cast<LPARAM>(std::lround(speechRate_ * 100.0F)));
     std::wostringstream speechRateText;
-    speechRateText << std::fixed << std::setprecision(1) << speechRate_ << L"x";
+    speechRateText << L"Speed: " << std::fixed << std::setprecision(1)
+                   << speechRate_ << L"x";
     if (!SetWindowTextW(speechRateLabel_, speechRateText.str().c_str())) {
         throw ReaderError(ReaderErrorCode::RenderingFailed,
                           "Could not update the speech speed label");
@@ -887,11 +1644,29 @@ void Direct2DTextRenderer::sync_toolbar_controls() {
             speechState_ == PlaybackState::Paused ? L"Resume" : L"Play";
         SetWindowTextW(speechPlayButton_, label);
     }
+    if (focusModeButton_ != nullptr) {
+        SetWindowTextW(focusModeButton_, mode_ == ReaderMode::Focus
+                                             ? L"Floating Mode"
+                                             : L"Focus Mode");
+    }
+    if (captureButton_ != nullptr) {
+        EnableWindow(captureButton_, onCaptureRequested_ ? TRUE : FALSE);
+    }
+    if (clipboardButton_ != nullptr) {
+        EnableWindow(clipboardButton_, onClipboardRequested_ ? TRUE : FALSE);
+    }
     EnableWindow(speechVoiceCombo_, speechAvailable_ ? TRUE : FALSE);
     EnableWindow(speechPlayButton_,
                  speechAvailable_ && speechState_ != PlaybackState::Loading
                      ? TRUE
                      : FALSE);
+    if (speakWordButton_ != nullptr) {
+        const bool hasSelectedWord =
+            selectedWordIndex_.has_value() &&
+            *selectedWordIndex_ < document_.words.size();
+        EnableWindow(speakWordButton_,
+                     speechAvailable_ && hasSelectedWord ? TRUE : FALSE);
+    }
     EnableWindow(speechStopButton_, speechAvailable_ ? TRUE : FALSE);
     EnableWindow(speechRateTrackbar_, speechAvailable_ ? TRUE : FALSE);
 }
@@ -971,6 +1746,22 @@ void Direct2DTextRenderer::handle_command(int controlId,
             SendMessageW(bimodalHighlightingCheckBox_, BM_GETCHECK, 0, 0) ==
             BST_CHECKED;
         break;
+    case kFocusModeControlId:
+        if (notificationCode == BN_CLICKED) {
+            set_mode(mode_ == ReaderMode::Focus ? ReaderMode::Floating
+                                                : ReaderMode::Focus);
+        }
+        return;
+    case kCaptureControlId:
+        if (notificationCode == BN_CLICKED && onCaptureRequested_) {
+            onCaptureRequested_();
+        }
+        return;
+    case kClipboardControlId:
+        if (notificationCode == BN_CLICKED && onClipboardRequested_) {
+            onClipboardRequested_();
+        }
+        return;
     case kSpeechVoiceControlId:
         return;
     case kSpeechPlayControlId:
@@ -980,10 +1771,15 @@ void Direct2DTextRenderer::handle_command(int controlId,
         }
         handle_speech_command(controlId);
         return;
+    case kSpeakWordControlId:
+        if (notificationCode == BN_CLICKED) {
+            speak_selected_word();
+        }
+        return;
     default:
         return;
     }
-    set_profile(updated);
+    commit_ui_profile(updated);
 }
 
 void Direct2DTextRenderer::handle_horizontal_scroll(HWND control) {
@@ -1012,10 +1808,89 @@ void Direct2DTextRenderer::handle_horizontal_scroll(HWND control) {
         updated.lineHeight =
             static_cast<float>(SendMessageW(control, TBM_GETPOS, 0, 0)) /
             10.0F;
+    } else if (control == lineWidthTrackbar_) {
+        updated.lineWidthCh = static_cast<std::uint32_t>(
+            std::clamp<LRESULT>(SendMessageW(control, TBM_GETPOS, 0, 0), 35, 100));
     } else {
         return;
     }
-    set_profile(updated);
+    commit_ui_profile(updated);
+}
+
+void Direct2DTextRenderer::start_speech_request(
+    std::optional<TextRange> selection) {
+    if (speechEngine_ == nullptr || !speechAvailable_) {
+        return;
+    }
+    try {
+        const LRESULT selected =
+            SendMessageW(speechVoiceCombo_, CB_GETCURSEL, 0, 0);
+        if (selected == CB_ERR) {
+            throw ReaderError(ReaderErrorCode::SpeechUnavailable,
+                              "Select a local speech voice before playback");
+        }
+        const auto voiceIndex = static_cast<std::size_t>(
+            SendMessageW(speechVoiceCombo_, CB_GETITEMDATA,
+                         static_cast<WPARAM>(selected), 0));
+        if (voiceIndex >= speechVoices_.size()) {
+            throw ReaderError(ReaderErrorCode::SpeechUnavailable,
+                              "The selected local speech voice is invalid");
+        }
+
+        SpeechRequest request;
+        request.text = document_.text;
+        request.selection = selection;
+        request.voiceId = speechVoices_[voiceIndex].id;
+        request.rate = speechRate_;
+        speechState_ = PlaybackState::Loading;
+        highlights_ = {};
+        highlights_.wordTimingReliable = speechCapabilities_.wordTiming;
+        highlights_.sentenceTimingReliable =
+            speechCapabilities_.sentenceTiming;
+        refresh_highlight_visuals();
+        sync_toolbar_controls();
+
+        const auto session = ++speechSession_;
+        const std::weak_ptr<SpeechDispatchState> dispatch = speechDispatch_;
+        speechEngine_->start(
+            request, [dispatch, session](const SpeechEvent& event) {
+                const auto state = dispatch.lock();
+                if (!state) {
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->window == nullptr) {
+                    return;
+                }
+                state->pendingEvents.push_back({session, event});
+                if (!PostMessageW(state->window, kSpeechEventMessage, 0, 0)) {
+                    state->pendingEvents.clear();
+                    OutputDebugStringA(
+                        "Could not post a Windows speech event to the reader window\n");
+                }
+            });
+    } catch (const ReaderError& error) {
+        speechState_ = PlaybackState::Failed;
+        highlights_ = {};
+        refresh_highlight_visuals();
+        sync_toolbar_controls();
+        MessageBoxA(hwnd_, error.what(), "Speech playback",
+                    MB_OK | MB_ICONWARNING);
+    }
+}
+
+void Direct2DTextRenderer::speak_selected_word() {
+    if (!speechAvailable_ || speechEngine_ == nullptr ||
+        !selectedWordIndex_.has_value() ||
+        *selectedWordIndex_ >= document_.words.size()) {
+        return;
+    }
+    const TextRange wordRange = document_.words[*selectedWordIndex_].text;
+    if (wordRange.length == 0 || wordRange.start >= document_.text.size() ||
+        wordRange.length > document_.text.size() - wordRange.start) {
+        return;
+    }
+    start_speech_request(wordRange);
 }
 
 void Direct2DTextRenderer::handle_speech_command(int controlId) {
@@ -1046,51 +1921,18 @@ void Direct2DTextRenderer::handle_speech_command(int controlId) {
             return;
         }
 
-        const LRESULT selected =
-            SendMessageW(speechVoiceCombo_, CB_GETCURSEL, 0, 0);
-        if (selected == CB_ERR) {
-            throw ReaderError(ReaderErrorCode::SpeechUnavailable,
-                              "Select a local speech voice before playback");
+        std::optional<TextRange> rangeFromCursor;
+        if (selectedWordIndex_.has_value() &&
+            *selectedWordIndex_ < document_.words.size()) {
+            const TextOffset start =
+                document_.words[*selectedWordIndex_].text.start;
+            if (start < document_.text.size()) {
+                rangeFromCursor = TextRange{
+                    start,
+                    static_cast<TextOffset>(document_.text.size() - start)};
+            }
         }
-        const auto voiceIndex = static_cast<std::size_t>(
-            SendMessageW(speechVoiceCombo_, CB_GETITEMDATA,
-                         static_cast<WPARAM>(selected), 0));
-        if (voiceIndex >= speechVoices_.size()) {
-            throw ReaderError(ReaderErrorCode::SpeechUnavailable,
-                              "The selected local speech voice is invalid");
-        }
-
-        SpeechRequest request;
-        request.text = document_.text;
-        request.voiceId = speechVoices_[voiceIndex].id;
-        request.rate = speechRate_;
-        speechState_ = PlaybackState::Loading;
-        highlights_ = {};
-        highlights_.wordTimingReliable = speechCapabilities_.wordTiming;
-        highlights_.sentenceTimingReliable =
-            speechCapabilities_.sentenceTiming;
-        refresh_highlight_visuals();
-        sync_toolbar_controls();
-
-        const auto session = ++speechSession_;
-        const std::weak_ptr<SpeechDispatchState> dispatch = speechDispatch_;
-        speechEngine_->start(
-            request, [dispatch, session](const SpeechEvent& event) {
-                const auto state = dispatch.lock();
-                if (!state) {
-                    return;
-                }
-                std::lock_guard<std::mutex> lock(state->mutex);
-                if (state->window == nullptr) {
-                    return;
-                }
-                state->pendingEvents.push_back({session, event});
-                if (!PostMessageW(state->window, kSpeechEventMessage, 0, 0)) {
-                    state->pendingEvents.clear();
-                    OutputDebugStringA(
-                        "Could not post a Windows speech event to the reader window\n");
-                }
-            });
+        start_speech_request(rangeFromCursor);
     } catch (const ReaderError& error) {
         speechState_ = PlaybackState::Failed;
         highlights_ = {};
@@ -1136,9 +1978,11 @@ void Direct2DTextRenderer::handle_speech_event(const SpeechEvent& event) {
             if (event.mark->kind == SpeechMarkKind::Word &&
                 highlights_.wordTimingReliable) {
                 highlights_.word = range;
+                update_focus_scroll(range);
             } else if (event.mark->kind == SpeechMarkKind::Sentence &&
                        highlights_.sentenceTimingReliable) {
                 highlights_.sentence = range;
+                update_focus_scroll(range);
             }
         }
         break;
@@ -1205,11 +2049,9 @@ void Direct2DTextRenderer::refresh_aid_visuals() {
 
         if (viewport_.size.height > 0) {
             const auto& bounds = layout.lines[selected].bounds;
-            const float visibleTop =
-                kToolbarHeightDip + kTextPaddingDip;
+            const float visibleTop = kTextPaddingDip;
             const float visibleBottom =
-                kToolbarHeightDip + viewport_.size.height -
-                kTextPaddingDip;
+                viewport_.size.height - kTextPaddingDip;
             if (bounds.y - viewport_.scrollY < visibleTop) {
                 viewport_.scrollY = std::max(0.0F, bounds.y - visibleTop);
             } else if (bounds.y + bounds.height - viewport_.scrollY >
@@ -1250,8 +2092,7 @@ void Direct2DTextRenderer::refresh_highlight_visuals() {
 }
 
 void Direct2DTextRenderer::select_ruler_line_at(int pixelY) {
-    if (!profile_.aids.readingRuler ||
-        pixelY < static_cast<int>(scale_dip(kToolbarHeightDip, dpiY_))) {
+    if (!profile_.aids.readingRuler || pixelY < 0) {
         return;
     }
     const auto layout = line_layout_snapshot();
@@ -1316,15 +2157,289 @@ bool Direct2DTextRenderer::handle_ruler_key(WPARAM key) {
     return false;
 }
 
+void Direct2DTextRenderer::sync_ruler_to_word() {
+    if (!profile_.aids.readingRuler || !selectedWordIndex_.has_value() ||
+        *selectedWordIndex_ >= document_.words.size()) {
+        return;
+    }
+    rulerAnchorOffset_ = document_.words[*selectedWordIndex_].text.start;
+    refresh_aid_visuals();
+}
+
+void Direct2DTextRenderer::clear_word_cursor() {
+    if (!selectedWordIndex_.has_value()) {
+        return;
+    }
+    selectedWordIndex_.reset();
+    cursorTargetCenterX_ = -1.0F;
+    sync_toolbar_controls();
+    invalidate();
+}
+
+bool Direct2DTextRenderer::select_word_at_point(int pixelX, int pixelY) {
+    if (textLayout_ == nullptr || document_.words.empty()) {
+        return false;
+    }
+    const UINT effDpiX = dpiX_ == 0 ? USER_DEFAULT_SCREEN_DPI : dpiX_;
+    const UINT effDpiY = dpiY_ == 0 ? USER_DEFAULT_SCREEN_DPI : dpiY_;
+    const float dipX =
+        static_cast<float>(pixelX) * 96.0F / static_cast<float>(effDpiX);
+    const float dipY =
+        static_cast<float>(pixelY) * 96.0F / static_cast<float>(effDpiY) +
+        viewport_.scrollY;
+
+    const auto lines = line_layout_snapshot().lines;
+    std::optional<std::size_t> matchedLine;
+    float bestLineDistY = 6.0F;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const auto& b = lines[i].bounds;
+        const float bottom = b.y + b.height;
+        const float distY =
+            dipY < b.y ? b.y - dipY : dipY > bottom ? dipY - bottom : 0.0F;
+        if (distY <= bestLineDistY) {
+            bestLineDistY = distY;
+            matchedLine = i;
+        }
+    }
+    if (!matchedLine.has_value()) {
+        return false;
+    }
+
+    const auto& line = lines[*matchedLine];
+    const float layoutX = dipX - text_column_metrics().first;
+    const float layoutY = dipY - kTextPaddingDip;
+    BOOL isTrailingHit = FALSE;
+    BOOL isInside = FALSE;
+    DWRITE_HIT_TEST_METRICS metrics{};
+    if (FAILED(textLayout_->HitTestPoint(layoutX, layoutY, &isTrailingHit,
+                                         &isInside, &metrics))) {
+        return false;
+    }
+
+    const TextOffset lineStart = line.text.start;
+    const TextOffset lineEnd = line.text.start + line.text.length;
+    std::optional<std::size_t> bestWord;
+    float bestDistX = 32.0F;
+    float bestCenterX = -1.0F;
+
+    for (std::size_t idx = 0; idx < document_.words.size(); ++idx) {
+        const auto& w = document_.words[idx].text;
+        const TextOffset wEnd = w.start + w.length;
+        if (w.length == 0 || wEnd <= lineStart || w.start >= lineEnd) {
+            continue;
+        }
+        const auto bounds = text_range_bounds(w);
+        if (bounds.empty()) {
+            continue;
+        }
+        const auto& rect = bounds.front();
+        const float centerX = rect.x + rect.width * 0.5F;
+        if (isInside && metrics.textPosition >= w.start &&
+            metrics.textPosition < wEnd) {
+            bestWord = idx;
+            bestCenterX = centerX;
+            break;
+        }
+        const float rectRight = rect.x + rect.width;
+        const float distX =
+            dipX < rect.x ? rect.x - dipX
+                          : dipX > rectRight ? dipX - rectRight : 0.0F;
+        if (distX <= bestDistX) {
+            bestDistX = distX;
+            bestWord = idx;
+            bestCenterX = centerX;
+        }
+    }
+
+    if (!bestWord.has_value()) {
+        return false;
+    }
+    selectedWordIndex_ = bestWord;
+    cursorTargetCenterX_ = bestCenterX;
+    update_focus_scroll(document_.words[*bestWord].text);
+    sync_ruler_to_word();
+    sync_toolbar_controls();
+    invalidate();
+    return true;
+}
+
+void Direct2DTextRenderer::move_word_cursor(int wordDelta) {
+    if (document_.words.empty()) {
+        return;
+    }
+    std::size_t nextIndex = 0;
+    if (!selectedWordIndex_.has_value()) {
+        if (wordDelta >= 0) {
+            for (std::size_t i = 0; i < document_.words.size(); ++i) {
+                const auto bounds = text_range_bounds(document_.words[i].text);
+                if (!bounds.empty() &&
+                    bounds.front().y + bounds.front().height >=
+                        viewport_.scrollY) {
+                    nextIndex = i;
+                    break;
+                }
+            }
+        } else {
+            nextIndex = document_.words.size() - 1;
+        }
+    } else {
+        const std::ptrdiff_t maxIndex =
+            static_cast<std::ptrdiff_t>(document_.words.size() - 1);
+        const std::ptrdiff_t candidate = std::clamp<std::ptrdiff_t>(
+            static_cast<std::ptrdiff_t>(*selectedWordIndex_) + wordDelta, 0,
+            maxIndex);
+        nextIndex = static_cast<std::size_t>(candidate);
+    }
+
+    selectedWordIndex_ = nextIndex;
+    const auto bounds = text_range_bounds(document_.words[nextIndex].text);
+    cursorTargetCenterX_ =
+        bounds.empty() ? -1.0F
+                       : bounds.front().x + bounds.front().width * 0.5F;
+    update_focus_scroll(document_.words[nextIndex].text);
+    sync_ruler_to_word();
+    sync_toolbar_controls();
+    invalidate();
+}
+
+void Direct2DTextRenderer::move_word_cursor_line(int lineDelta) {
+    if (document_.words.empty()) {
+        return;
+    }
+    if (!selectedWordIndex_.has_value() || lineDelta == 0) {
+        move_word_cursor(lineDelta >= 0 ? 0 : -1);
+        return;
+    }
+    const auto lines = line_layout_snapshot().lines;
+    if (lines.empty()) {
+        return;
+    }
+
+    const TextOffset curStart = document_.words[*selectedWordIndex_].text.start;
+    std::size_t curLine = 0;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const TextOffset lineEnd = lines[i].text.start + lines[i].text.length;
+        if (curStart >= lines[i].text.start && curStart < lineEnd) {
+            curLine = i;
+            break;
+        }
+        if (lines[i].text.start <= curStart) {
+            curLine = i;
+        }
+    }
+
+    float targetX = cursorTargetCenterX_;
+    if (targetX < 0.0F) {
+        const auto curBounds =
+            text_range_bounds(document_.words[*selectedWordIndex_].text);
+        targetX = curBounds.empty()
+                      ? 0.0F
+                      : curBounds.front().x + curBounds.front().width * 0.5F;
+        cursorTargetCenterX_ = targetX;
+    }
+
+    const int step = lineDelta > 0 ? 1 : -1;
+    std::optional<std::size_t> bestWord;
+    for (std::ptrdiff_t candidateLine = static_cast<std::ptrdiff_t>(curLine) + step;
+         candidateLine >= 0 &&
+         candidateLine < static_cast<std::ptrdiff_t>(lines.size());
+         candidateLine += step) {
+        const auto& line = lines[static_cast<std::size_t>(candidateLine)];
+        const TextOffset lineStart = line.text.start;
+        const TextOffset lineEnd = line.text.start + line.text.length;
+        float bestDistX = std::numeric_limits<float>::max();
+        for (std::size_t idx = 0; idx < document_.words.size(); ++idx) {
+            const auto& w = document_.words[idx].text;
+            const TextOffset wEnd = w.start + w.length;
+            if (w.length == 0 || wEnd <= lineStart || w.start >= lineEnd) {
+                continue;
+            }
+            const auto bounds = text_range_bounds(w);
+            if (bounds.empty()) {
+                continue;
+            }
+            const float centerX =
+                bounds.front().x + bounds.front().width * 0.5F;
+            const float dist = std::abs(centerX - targetX);
+            if (dist < bestDistX) {
+                bestDistX = dist;
+                bestWord = idx;
+            }
+        }
+        if (bestWord.has_value()) {
+            break;
+        }
+    }
+
+    if (!bestWord.has_value()) {
+        return;
+    }
+    selectedWordIndex_ = bestWord;
+    update_focus_scroll(document_.words[*bestWord].text);
+    sync_ruler_to_word();
+    sync_toolbar_controls();
+    invalidate();
+}
+
+void Direct2DTextRenderer::draw_word_cursor(bool underText) const {
+    if (!selectedWordIndex_.has_value() ||
+        *selectedWordIndex_ >= document_.words.size() ||
+        rulerBrush_ == nullptr || renderTarget_ == nullptr) {
+        return;
+    }
+    const auto bounds =
+        text_range_bounds(document_.words[*selectedWordIndex_].text);
+    if (bounds.empty()) {
+        return;
+    }
+    const auto& tokens = theme_tokens(profile_.theme);
+    rulerBrush_->SetColor(color_from_hex(tokens.focus));
+    if (underText) {
+        rulerBrush_->SetOpacity(
+            profile_.theme == ThemeId::DarkHighContrast ? 0.28F : 0.16F);
+        for (const auto& rect : bounds) {
+            D2D1_ROUNDED_RECT rounded{};
+            rounded.rect = D2D1::RectF(
+                rect.x - 2.0F, rect.y - 1.0F,
+                rect.x + rect.width + 2.0F, rect.y + rect.height + 1.0F);
+            rounded.radiusX = 3.0F;
+            rounded.radiusY = 3.0F;
+            renderTarget_->FillRoundedRectangle(&rounded, rulerBrush_.Get());
+        }
+    } else {
+        rulerBrush_->SetOpacity(0.92F);
+        for (const auto& rect : bounds) {
+            D2D1_ROUNDED_RECT rounded{};
+            rounded.rect = D2D1::RectF(
+                rect.x - 2.0F, rect.y - 1.0F,
+                rect.x + rect.width + 2.0F, rect.y + rect.height + 1.0F);
+            rounded.radiusX = 3.0F;
+            rounded.radiusY = 3.0F;
+            renderTarget_->DrawRoundedRectangle(
+                &rounded, rulerBrush_.Get(), 1.5F);
+        }
+        const auto& first = bounds.front();
+        renderTarget_->FillRectangle(
+            D2D1::RectF(first.x - 3.5F, first.y - 1.0F,
+                        first.x - 1.0F, first.y + first.height + 1.0F),
+            rulerBrush_.Get());
+    }
+    rulerBrush_->SetOpacity(1.0F);
+}
+
 void Direct2DTextRenderer::ensure_render_target() {
     if (renderTarget_ != nullptr) {
         return;
     }
+    if (canvasHwnd_ == nullptr) {
+        throw ReaderError(ReaderErrorCode::RenderingFailed,
+                          "Reader canvas window has not been created");
+    }
 
     RECT client{};
-    if (!GetClientRect(hwnd_, &client)) {
+    if (!GetClientRect(canvasHwnd_, &client)) {
         throw ReaderError(ReaderErrorCode::RenderingFailed,
-                          "Could not determine reader client dimensions");
+                          "Could not determine reader canvas dimensions");
     }
 
     D2D1_RENDER_TARGET_PROPERTIES properties =
@@ -1336,10 +2451,11 @@ void Direct2DTextRenderer::ensure_render_target() {
         d2dFactory_->CreateHwndRenderTarget(
             properties,
             D2D1::HwndRenderTargetProperties(
-                hwnd_,
+                canvasHwnd_,
                 D2D1::SizeU(
-                    static_cast<UINT>(client.right - client.left),
-                    static_cast<UINT>(client.bottom - client.top))),
+                    static_cast<UINT>(std::max(1L, client.right - client.left)),
+                    static_cast<UINT>(
+                        std::max(1L, client.bottom - client.top)))),
             renderTarget_.GetAddressOf()),
         "ID2D1Factory::CreateHwndRenderTarget");
     check_hresult(renderTarget_->CreateSolidColorBrush(
@@ -1379,7 +2495,7 @@ void Direct2DTextRenderer::rebuild_text_layout() {
                   "IDWriteTextFormat::SetLineSpacing");
 
     const float width =
-        std::max(1.0F, viewport_.size.width - 2 * kTextPaddingDip);
+        text_column_metrics().second;
     constexpr float layoutHeight = 1'000'000.0F;
     if (document_.text.size() >
         static_cast<std::size_t>(std::numeric_limits<UINT32>::max())) {
@@ -1404,6 +2520,8 @@ void Direct2DTextRenderer::rebuild_text_layout() {
                               0, static_cast<UINT32>(document_.text.size())}),
                       "IDWriteTextLayout1::SetCharacterSpacing");
     }
+    viewport_.scrollY = std::clamp(viewport_.scrollY, 0.0F, max_scroll_y());
+    sync_scrollbar();
 }
 
 void Direct2DTextRenderer::discard_device_resources() noexcept {
@@ -1413,15 +2531,48 @@ void Direct2DTextRenderer::discard_device_resources() noexcept {
 }
 
 void Direct2DTextRenderer::paint() {
-    if (hwnd_ == nullptr) {
+    if (canvasHwnd_ == nullptr || (hwnd_ != nullptr && IsIconic(hwnd_))) {
+        return;
+    }
+    RECT canvasClient{};
+    if (!GetClientRect(canvasHwnd_, &canvasClient) ||
+        canvasClient.right - canvasClient.left <= 0 ||
+        canvasClient.bottom - canvasClient.top <= 0) {
         return;
     }
     try {
         ensure_render_target();
-        textBrush_->SetColor(color_from_hex(theme_tokens(profile_.theme).text));
+        const auto& tokens = theme_tokens(profile_.theme);
+        textBrush_->SetColor(color_from_hex(tokens.text));
         renderTarget_->BeginDraw();
-        renderTarget_->Clear(
-            color_from_hex(theme_tokens(profile_.theme).background));
+        renderTarget_->Clear(color_from_hex(tokens.background));
+
+        const auto [colOriginX, colWidth] = text_column_metrics();
+        if (colOriginX > kTextPaddingDip + 12.0F &&
+            viewport_.size.height > 0.0F) {
+            const float pageLeft = std::max(0.0F, colOriginX - 24.0F);
+            const float pageRight =
+                std::min(viewport_.size.width, colOriginX + colWidth + 24.0F);
+            const float viewBottom = viewport_.size.height;
+            rulerBrush_->SetColor(color_from_hex(tokens.surface));
+            rulerBrush_->SetOpacity(0.55F);
+            renderTarget_->FillRectangle(
+                D2D1::RectF(0.0F, 0.0F, pageLeft, viewBottom),
+                rulerBrush_.Get());
+            renderTarget_->FillRectangle(
+                D2D1::RectF(pageRight, 0.0F, viewport_.size.width, viewBottom),
+                rulerBrush_.Get());
+            rulerBrush_->SetColor(color_from_hex(tokens.border));
+            rulerBrush_->SetOpacity(0.65F);
+            renderTarget_->DrawLine(
+                D2D1::Point2F(pageLeft, 0.0F),
+                D2D1::Point2F(pageLeft, viewBottom), rulerBrush_.Get(), 1.0F);
+            renderTarget_->DrawLine(
+                D2D1::Point2F(pageRight, 0.0F),
+                D2D1::Point2F(pageRight, viewBottom), rulerBrush_.Get(), 1.0F);
+            rulerBrush_->SetOpacity(1.0F);
+        }
+
         renderTarget_->SetTransform(
             D2D1::Matrix3x2F::Translation(0, -viewport_.scrollY));
         const auto drawRulerOverlays = [this](bool behindText) {
@@ -1483,20 +2634,22 @@ void Direct2DTextRenderer::paint() {
         };
         drawRulerOverlays(true);
         drawSentenceHighlights();
+        draw_word_cursor(true);
         if (textLayout_ != nullptr && textBrush_ != nullptr) {
             renderTarget_->DrawTextLayout(
-                D2D1::Point2F(kTextPaddingDip,
-                              kToolbarHeightDip + kTextPaddingDip),
+                D2D1::Point2F(text_column_metrics().first, kTextPaddingDip),
                 textLayout_.Get(), textBrush_.Get(),
                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
         drawRulerOverlays(false);
         drawWordHighlights();
+        draw_word_cursor(false);
         renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+
         const HRESULT result = renderTarget_->EndDraw();
         if (result == D2DERR_RECREATE_TARGET) {
             discard_device_resources();
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            InvalidateRect(canvasHwnd_, nullptr, FALSE);
         } else {
             check_hresult(result, "ID2D1RenderTarget::EndDraw");
         }
@@ -1509,11 +2662,11 @@ void Direct2DTextRenderer::paint() {
 }
 
 void Direct2DTextRenderer::resize_viewport() {
-    if (hwnd_ == nullptr) {
+    if (canvasHwnd_ == nullptr) {
         return;
     }
     RECT client{};
-    if (!GetClientRect(hwnd_, &client)) {
+    if (!GetClientRect(canvasHwnd_, &client)) {
         return;
     }
     const UINT effectiveDpiX =
@@ -1523,11 +2676,10 @@ void Direct2DTextRenderer::resize_viewport() {
     const float pixelsToDipsX = 96.0F / static_cast<float>(effectiveDpiX);
     const float pixelsToDipsY = 96.0F / static_cast<float>(effectiveDpiY);
     viewport_.size = {
-        static_cast<float>(client.right - client.left) * pixelsToDipsX,
-        std::max(0.0F,
-                 static_cast<float>(client.bottom - client.top) *
-                         pixelsToDipsY -
-                     kToolbarHeightDip)};
+        static_cast<float>(std::max(0L, client.right - client.left)) *
+            pixelsToDipsX,
+        static_cast<float>(std::max(0L, client.bottom - client.top)) *
+            pixelsToDipsY};
 }
 
 void Direct2DTextRenderer::require_ui_thread() const {
