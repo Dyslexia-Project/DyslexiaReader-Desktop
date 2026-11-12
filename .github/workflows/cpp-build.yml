@@ -1,0 +1,86 @@
+name: C++ Desktop CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Win32 .exe & Run Tests (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure CMake
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run CTest Unit Tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Assemble portable release artifact
+        shell: pwsh
+        run: |
+          $artifactDir = "artifact\DyslexiaReader-Desktop"
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+
+          # Search for compiled executables in build
+          $exeFiles = Get-ChildItem -Path "build" -Filter "*.exe" -Recurse
+          if ($exeFiles.Count -gt 0) {
+            foreach ($exe in $exeFiles) {
+              Copy-Item $exe.FullName -Destination $artifactDir
+              Write-Host "Bundled executable: $($exe.Name)"
+            }
+          } else {
+            Write-Error "No executable found in build!"
+            exit 1
+          }
+
+          # Bundle font assets (Atkinson Hyperlegible, Lexend, OpenDyslexic)
+          if (Test-Path "assets\fonts") {
+            New-Item -ItemType Directory -Force -Path "$artifactDir\fonts" | Out-Null
+            Copy-Item -Recurse "assets\fonts\*" -Destination "$artifactDir\fonts"
+            Write-Host "Bundled fonts from assets\fonts"
+          }
+
+          # Include contract docs for reference
+          if (Test-Path "docs\contracts") {
+            New-Item -ItemType Directory -Force -Path "$artifactDir\contracts" | Out-Null
+            Copy-Item -Recurse "docs\contracts\*" -Destination "$artifactDir\contracts"
+          }
+
+          # Write build metadata for QA tracking
+          @"
+          DyslexiaReader Desktop - Portable Release
+          =========================================
+          Commit SHA : ${{ github.sha }}
+          Branch/Ref : ${{ github.ref_name }}
+          Runner OS  : ${{ runner.os }}
+          Build Date : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC' -AsUTC)
+          Target Arch: x64 (Win32 unpackaged)
+          "@ | Set-Content "$artifactDir\BUILD_INFO.txt"
+
+      - name: Upload portable release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DyslexiaReader-Desktop-${{ github.sha }}
+          path: artifact\
+          retention-days: 30
+          if-no-files-found: error
