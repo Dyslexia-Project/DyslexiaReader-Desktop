@@ -2,10 +2,12 @@
 
 #include "dyslexia_reader/interfaces.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace dyslexia_reader::windows {
 
@@ -21,6 +23,12 @@ public:
     WindowsCloudSpeechClient& operator=(const WindowsCloudSpeechClient&) = delete;
 
     CloudSpeechResult synthesize(const CloudSpeechRequest& request) override;
+
+    static std::string build_synthesize_request_json(
+        const CloudSpeechRequest& request, std::string_view language = {});
+    static CloudSpeechResult parse_synthesize_response_json(
+        const std::string& json, std::size_t inputLength,
+        TextOffset baseOffset = 0);
 
 private:
     class Impl;

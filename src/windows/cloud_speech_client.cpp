@@ -1,6 +1,7 @@
 #include "dyslexia_reader/windows/cloud_speech_client.hpp"
 
 #include <windows.h>
+#include <objbase.h>
 #include <wincrypt.h>
 #include <winhttp.h>
 #include <winrt/Windows.Data.Json.h>
@@ -9,9 +10,11 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cwctype>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -29,6 +32,9 @@ constexpr std::uint32_t kMaxSpeechMarks = 1000000;
 class ApartmentScope final {
 public:
     ApartmentScope() {
+        static std::once_flag mtaOnce;
+        static CO_MTA_USAGE_COOKIE mtaCookie = nullptr;
+        std::call_once(mtaOnce, []() { (void)CoIncrementMTAUsage(&mtaCookie); });
         try {
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
             initialized_ = true;
@@ -103,10 +109,53 @@ winrt::hstring to_hstring(const std::u16string& value) {
                           static_cast<std::uint32_t>(value.size()));
 }
 
+bool equals_ascii_icase(std::wstring_view lhs, std::wstring_view rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        if (std::towlower(lhs[i]) != std::towlower(rhs[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_loopback_host(std::wstring_view host) {
+    return equals_ascii_icase(host, L"localhost") ||
+           host == L"127.0.0.1" || host == L"::1" || host == L"[::1]";
+}
+
+std::string infer_language_tag(std::string_view voiceId,
+                               std::string_view explicitLanguage) {
+    if (!explicitLanguage.empty()) {
+        return std::string(explicitLanguage);
+    }
+    if (voiceId.size() >= 5) {
+        const auto prefix = voiceId.substr(0, 5);
+        if ((prefix[0] == 'e' || prefix[0] == 'E') &&
+            (prefix[1] == 'n' || prefix[1] == 'N') &&
+            (prefix[2] == '-' || prefix[2] == '_') &&
+            (prefix[3] == 'g' || prefix[3] == 'G') &&
+            (prefix[4] == 'b' || prefix[4] == 'B')) {
+            return "en-GB";
+        }
+        if ((prefix[0] == 'r' || prefix[0] == 'R') &&
+            (prefix[1] == 'o' || prefix[1] == 'O') &&
+            (prefix[2] == '-' || prefix[2] == '_') &&
+            (prefix[3] == 'r' || prefix[3] == 'R') &&
+            (prefix[4] == 'o' || prefix[4] == 'O')) {
+            return "ro-RO";
+        }
+    }
+    return "en-US";
+}
+
 struct Endpoint {
     std::wstring host;
     INTERNET_PORT port = INTERNET_DEFAULT_HTTPS_PORT;
     std::wstring path;
+    bool secure = true;
 };
 
 Endpoint parse_endpoint(const std::wstring& baseUrl) {
@@ -139,10 +188,6 @@ Endpoint parse_endpoint(const std::wstring& baseUrl) {
                          &components)) {
         throw_network_error("WinHttpCrackUrl");
     }
-    if (components.nScheme != INTERNET_SCHEME_HTTPS) {
-        throw ReaderError(ReaderErrorCode::NetworkFailed,
-                          "Cloud speech service URL must use HTTPS");
-    }
     if (components.dwHostNameLength == 0 ||
         components.dwHostNameLength >= std::size(host) ||
         components.dwUrlPathLength >= std::size(path) ||
@@ -154,9 +199,21 @@ Endpoint parse_endpoint(const std::wstring& baseUrl) {
             "Cloud speech service URL has unsupported components");
     }
 
+    const std::wstring_view hostView(host, components.dwHostNameLength);
+    const bool isHttps = (components.nScheme == INTERNET_SCHEME_HTTPS);
+    const bool isLoopbackHttp =
+        (components.nScheme == INTERNET_SCHEME_HTTP) &&
+        is_loopback_host(hostView);
+    if (!isHttps && !isLoopbackHttp) {
+        throw ReaderError(
+            ReaderErrorCode::NetworkFailed,
+            "Cloud speech service URL must use HTTPS (except localhost)");
+    }
+
     Endpoint endpoint;
-    endpoint.host.assign(host, components.dwHostNameLength);
+    endpoint.host.assign(hostView);
     endpoint.port = components.nPort;
+    endpoint.secure = isHttps;
     endpoint.path.assign(path, components.dwUrlPathLength);
     while (!endpoint.path.empty() && endpoint.path.back() == L'/') {
         endpoint.path.pop_back();
@@ -166,16 +223,24 @@ Endpoint parse_endpoint(const std::wstring& baseUrl) {
 }
 
 std::string request_json(const std::u16string& text,
-                         const std::string& voiceId, float rate) {
+                         const std::string& voiceId, float rate,
+                         std::string_view language) {
     using namespace winrt::Windows::Data::Json;
+
+    ApartmentScope apartment;
+    const double roundedSpeed =
+        std::round(static_cast<double>(rate) * 100.0) / 100.0;
+    const std::string resolvedLanguage =
+        infer_language_tag(voiceId, language);
 
     JsonObject body;
     body.Insert(L"text", JsonValue::CreateStringValue(to_hstring(text)));
     body.Insert(L"voiceId",
                 JsonValue::CreateStringValue(winrt::to_hstring(voiceId)));
-    body.Insert(L"rate", JsonValue::CreateNumberValue(static_cast<double>(rate)));
-    body.Insert(L"includeAudio", JsonValue::CreateBooleanValue(true));
-    body.Insert(L"includeSpeechMarks", JsonValue::CreateBooleanValue(true));
+    body.Insert(L"speed", JsonValue::CreateNumberValue(roundedSpeed));
+    body.Insert(
+        L"language",
+        JsonValue::CreateStringValue(winrt::to_hstring(resolvedLanguage)));
     return winrt::to_string(body.Stringify());
 }
 
@@ -225,50 +290,91 @@ std::uint64_t required_milliseconds(
 }
 
 CloudSpeechResult parse_response(const std::string& json,
-                                std::size_t inputLength,
-                                TextOffset baseOffset) {
+                                 std::size_t inputLength,
+                                 TextOffset baseOffset) {
     using namespace winrt::Windows::Data::Json;
 
     try {
+        ApartmentScope apartment;
         const auto wideJson = utf8_to_wide(json);
         const auto object = JsonObject::Parse(winrt::hstring(wideJson));
-        if (!object.HasKey(L"audioChunks") ||
-            !object.HasKey(L"speechMarks") ||
-            !object.HasKey(L"wordTimingReliable") ||
-            !object.HasKey(L"sentenceTimingReliable")) {
+        if (!object.HasKey(L"speechMarks")) {
             throw_response_error(
                 "Cloud speech response is missing required fields");
         }
 
         CloudSpeechResult result;
-        result.wordTimingReliable =
-            object.GetNamedBoolean(L"wordTimingReliable");
-        result.sentenceTimingReliable =
-            object.GetNamedBoolean(L"sentenceTimingReliable");
 
-        const auto chunks = object.GetNamedArray(L"audioChunks");
-        if (chunks.Size() == 0 || chunks.Size() > kMaxAudioChunks) {
+        // Reliability flags: Platform v1 uses timingGranularity; provisional v1 uses booleans.
+        if (object.HasKey(L"timingGranularity")) {
+            const auto granularity = object.GetNamedString(L"timingGranularity");
+            const std::wstring_view granularityView(granularity);
+            if (granularityView == L"WORD_AND_SENTENCE") {
+                result.wordTimingReliable = true;
+                result.sentenceTimingReliable = true;
+            } else if (granularityView == L"SENTENCE_ONLY") {
+                result.wordTimingReliable = false;
+                result.sentenceTimingReliable = true;
+            } else if (granularityView == L"NONE") {
+                result.wordTimingReliable = false;
+                result.sentenceTimingReliable = false;
+            } else {
+                throw_response_error(
+                    "Cloud speech response has an unknown timingGranularity");
+            }
+        } else if (object.HasKey(L"wordTimingReliable") &&
+                   object.HasKey(L"sentenceTimingReliable")) {
+            result.wordTimingReliable =
+                object.GetNamedBoolean(L"wordTimingReliable");
+            result.sentenceTimingReliable =
+                object.GetNamedBoolean(L"sentenceTimingReliable");
+        } else {
             throw_response_error(
-                "Cloud speech response has an invalid audio chunk count");
+                "Cloud speech response is missing timing reliability metadata");
         }
-        std::size_t totalAudioBytes = 0;
-        result.chunks.reserve(chunks.Size());
-        for (const auto& value : chunks) {
-            const auto chunk = value.GetObject();
+
+        // Audio payload: Platform v1 uses audioMimeType + audioBase64; provisional v1 uses audioChunks[].
+        if (object.HasKey(L"audioMimeType") && object.HasKey(L"audioBase64")) {
             const auto mediaType =
-                winrt::to_string(chunk.GetNamedString(L"mediaType"));
+                winrt::to_string(object.GetNamedString(L"audioMimeType"));
             if (mediaType.empty() || mediaType.size() > 1024) {
                 throw_response_error(
                     "Cloud speech response has an invalid audio media type");
             }
-            auto bytes = decode_base64(chunk.GetNamedString(L"dataBase64"));
-            if (bytes.empty() ||
-                bytes.size() > kMaxAudioBytes - totalAudioBytes) {
+            auto bytes = decode_base64(object.GetNamedString(L"audioBase64"));
+            if (bytes.empty() || bytes.size() > kMaxAudioBytes) {
                 throw_response_error(
                     "Cloud speech response exceeds the audio size limit");
             }
-            totalAudioBytes += bytes.size();
             result.chunks.push_back({mediaType, std::move(bytes)});
+        } else if (object.HasKey(L"audioChunks")) {
+            const auto chunks = object.GetNamedArray(L"audioChunks");
+            if (chunks.Size() == 0 || chunks.Size() > kMaxAudioChunks) {
+                throw_response_error(
+                    "Cloud speech response has an invalid audio chunk count");
+            }
+            std::size_t totalAudioBytes = 0;
+            result.chunks.reserve(chunks.Size());
+            for (const auto& value : chunks) {
+                const auto chunk = value.GetObject();
+                const auto mediaType =
+                    winrt::to_string(chunk.GetNamedString(L"mediaType"));
+                if (mediaType.empty() || mediaType.size() > 1024) {
+                    throw_response_error(
+                        "Cloud speech response has an invalid audio media type");
+                }
+                auto bytes = decode_base64(chunk.GetNamedString(L"dataBase64"));
+                if (bytes.empty() ||
+                    bytes.size() > kMaxAudioBytes - totalAudioBytes) {
+                    throw_response_error(
+                        "Cloud speech response exceeds the audio size limit");
+                }
+                totalAudioBytes += bytes.size();
+                result.chunks.push_back({mediaType, std::move(bytes)});
+            }
+        } else {
+            throw_response_error(
+                "Cloud speech response is missing audio payload");
         }
 
         const auto marks = object.GetNamedArray(L"speechMarks");
@@ -280,27 +386,53 @@ CloudSpeechResult parse_response(const std::string& json,
         for (const auto& value : marks) {
             const auto mark = value.GetObject();
             const auto type = mark.GetNamedString(L"type");
+            const std::wstring_view typeView(type);
             SpeechMarkKind kind;
-            if (type == L"word") {
+            if (typeView == L"word") {
                 kind = SpeechMarkKind::Word;
-            } else if (type == L"sentence") {
+            } else if (typeView == L"sentence") {
                 kind = SpeechMarkKind::Sentence;
             } else {
                 throw_response_error(
                     "Cloud speech response has an unknown mark type");
             }
+
             const auto start = required_uint32(mark, L"start");
-            const auto length = required_uint32(mark, L"length");
-            if (length == 0 || start > inputLength ||
-                length > inputLength - start ||
+            std::uint32_t length = 0;
+            if (mark.HasKey(L"length")) {
+                length = required_uint32(mark, L"length");
+            } else if (mark.HasKey(L"end")) {
+                const auto end = required_uint32(mark, L"end");
+                if (end <= start) {
+                    throw_response_error(
+                        "Cloud speech response mark has end <= start");
+                }
+                length = end - start;
+            } else {
+                throw_response_error(
+                    "Cloud speech response mark is missing length/end");
+            }
+
+            std::uint64_t timeMs = 0;
+            if (mark.HasKey(L"timeMilliseconds")) {
+                timeMs = required_milliseconds(mark, L"timeMilliseconds");
+            } else if (mark.HasKey(L"time")) {
+                timeMs = required_milliseconds(mark, L"time");
+            } else {
+                throw_response_error(
+                    "Cloud speech response mark is missing timestamp");
+            }
+
+            if (length == 0 ||
+                static_cast<std::size_t>(start) > inputLength ||
+                static_cast<std::size_t>(length) >
+                    inputLength - static_cast<std::size_t>(start) ||
                 start > std::numeric_limits<TextOffset>::max() - baseOffset) {
                 throw_response_error(
                     "Cloud speech response contains a mark outside the text");
             }
             result.marks.push_back(
-                {kind,
-                 {baseOffset + start, length},
-                 required_milliseconds(mark, L"timeMilliseconds")});
+                {kind, {baseOffset + start, length}, timeMs});
         }
         return result;
     } catch (const ReaderError&) {
@@ -334,6 +466,23 @@ std::string read_response(HINTERNET request) {
         response.append(buffer.data(), read);
     }
     return response;
+}
+
+std::string extract_error_detail(HINTERNET request) {
+    try {
+        const std::string body = read_response(request);
+        if (body.empty()) {
+            return {};
+        }
+        using namespace winrt::Windows::Data::Json;
+        const auto wide = utf8_to_wide(body);
+        const auto obj = JsonObject::Parse(winrt::hstring(wide));
+        if (obj.HasKey(L"message")) {
+            return winrt::to_string(obj.GetNamedString(L"message"));
+        }
+    } catch (...) {
+    }
+    return {};
 }
 
 void validate_request(const CloudSpeechRequest& request) {
@@ -376,7 +525,7 @@ public:
         }
         std::string body;
         try {
-            body = request_json(text, request.voiceId, request.rate);
+            body = request_json(text, request.voiceId, request.rate, {});
         } catch (const winrt::hresult_error&) {
             throw ReaderError(ReaderErrorCode::SpeechUnavailable,
                               "Could not serialize the cloud speech request");
@@ -419,7 +568,7 @@ public:
         WinHttpHandle httpRequest(WinHttpOpenRequest(
             connection.get(), L"POST", endpoint_.path.c_str(), nullptr,
             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-            WINHTTP_FLAG_SECURE));
+            endpoint_.secure ? WINHTTP_FLAG_SECURE : 0));
         if (!httpRequest) {
             throw_network_error("WinHttpOpenRequest");
         }
@@ -476,10 +625,14 @@ public:
             throw_network_error("WinHttpQueryHeaders");
         }
         if (status < 200 || status >= 300) {
-            throw ReaderError(
-                ReaderErrorCode::NetworkFailed,
+            const std::string detail = extract_error_detail(httpRequest.get());
+            std::string message =
                 "Cloud speech service returned HTTP status " +
-                    std::to_string(status));
+                std::to_string(status);
+            if (!detail.empty()) {
+                message += ": " + detail;
+            }
+            throw ReaderError(ReaderErrorCode::NetworkFailed, message);
         }
 
         const auto response = read_response(httpRequest.get());
@@ -501,6 +654,28 @@ WindowsCloudSpeechClient::~WindowsCloudSpeechClient() = default;
 CloudSpeechResult WindowsCloudSpeechClient::synthesize(
     const CloudSpeechRequest& request) {
     return impl_->synthesize(request);
+}
+
+std::string WindowsCloudSpeechClient::build_synthesize_request_json(
+    const CloudSpeechRequest& request, std::string_view language) {
+    validate_request(request);
+    std::u16string text = request.text;
+    if (request.selection) {
+        text = request.text.substr(request.selection->start,
+                                   request.selection->length);
+    }
+    try {
+        return request_json(text, request.voiceId, request.rate, language);
+    } catch (const winrt::hresult_error&) {
+        throw ReaderError(ReaderErrorCode::SpeechUnavailable,
+                          "Could not serialize the cloud speech request");
+    }
+}
+
+CloudSpeechResult WindowsCloudSpeechClient::parse_synthesize_response_json(
+    const std::string& json, std::size_t inputLength,
+    TextOffset baseOffset) {
+    return parse_response(json, inputLength, baseOffset);
 }
 
 }  // namespace dyslexia_reader::windows

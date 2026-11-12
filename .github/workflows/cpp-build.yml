@@ -1,0 +1,119 @@
+name: C++ Desktop CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  schema-check:
+    name: Schema Contract Check (ajv-cli)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install ajv-cli
+        run: npm install -g ajv-cli
+
+      - name: Validate reading profile contract example
+        run: |
+          ajv validate \
+            --spec=draft7 \
+            -s docs/contracts/reading-profile.schema.json \
+            -d docs/contracts/reading-profile.example.json
+
+  windows-build:
+    name: Build Win32 .exe, Test & Package (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\vcpkg-cache
+          key: ${{ runner.os }}-x64-vcpkg-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-x64-vcpkg-
+
+      - name: Configure CMake (with vcpkg manifest)
+        shell: pwsh
+        run: |
+          $vcpkgRoot = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } else { $env:VCPKG_INSTALLATION_ROOT }
+          if (-not $vcpkgRoot -or -not (Test-Path "$vcpkgRoot\scripts\buildsystems\vcpkg.cmake")) {
+            throw "vcpkg toolchain not found (VCPKG_ROOT='$env:VCPKG_ROOT', VCPKG_INSTALLATION_ROOT='$env:VCPKG_INSTALLATION_ROOT')"
+          }
+          $cacheDir = Join-Path $env:RUNNER_TEMP "vcpkg-cache"
+          New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+          $env:VCPKG_ROOT = $vcpkgRoot
+          $env:VCPKG_BINARY_SOURCES = "clear;files,$cacheDir,readwrite"
+          cmake -B build -S . -A x64
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Run CTest Smoke Suite
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Assemble & verify portable release artifact
+        shell: pwsh
+        run: |
+          pwsh -File scripts/package_portable.ps1 `
+            -BuildDir build `
+            -Config Release `
+            -OutputDir artifact\DyslexiaReader-Desktop `
+            -CommitSha "${{ github.sha }}" `
+            -RefName "${{ github.ref_name }}" `
+            -VerifyOcr
+
+      - name: Upload portable release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DyslexiaReader-Desktop-${{ github.sha }}
+          path: artifact\
+          retention-days: 30
+          if-no-files-found: error
+
+  macos-build:
+    name: Build macOS OCR & Run Portable Tests (macos-latest)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Tesseract, Leptonica, and nlohmann-json
+        run: brew install tesseract leptonica nlohmann-json pkg-config
+
+      - name: Configure CMake
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run CTest Portable Suite
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke test macOS CLI binary
+        run: ./build/dyslexia_reader_demo test.png

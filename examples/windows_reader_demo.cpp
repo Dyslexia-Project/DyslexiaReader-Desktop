@@ -2,10 +2,12 @@
 #include "dyslexia_reader/tesseract_ocr_engine.hpp"
 #include "dyslexia_reader/windows/direct2d_text_renderer.hpp"
 #include "dyslexia_reader/windows/font_resource_loader.hpp"
+#include "dyslexia_reader/windows/platform_profile_client.hpp"
 #include "dyslexia_reader/windows/profile_store.hpp"
 #include "dyslexia_reader/windows/screen_capturer.hpp"
 #include "dyslexia_reader/windows/speech_synthesizer.hpp"
 #include "dyslexia_reader/windows/tray_shell.hpp"
+#include "dyslexia_reader/windows/word_insights.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -14,6 +16,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shellapi.h>
 #include <winrt/base.h>
 
 #if defined(_MSC_VER)
@@ -24,7 +27,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -40,6 +45,7 @@ using namespace dyslexia_reader::windows;
 constexpr wchar_t kCoordinatorClassName[] = L"DyslexiaReader.CoordinatorWindow";
 constexpr UINT kMsgStartCapture = WM_APP + 0x51;
 constexpr UINT kMsgOcrCompleted = WM_APP + 0x52;
+constexpr UINT kMsgPlatformCompleted = WM_APP + 0x53;
 
 std::wstring wide_from_utf8_lossy(const std::string& utf8) {
     if (utf8.empty()) {
@@ -94,18 +100,262 @@ struct OcrJobResult {
     std::string errorMessage;
 };
 
+std::string utf8_from_wide(const std::wstring& wide) {
+    if (wide.empty()) {
+        return {};
+    }
+    const int size = WideCharToMultiByte(
+        CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0,
+        nullptr, nullptr);
+    if (size <= 0) {
+        return {};
+    }
+    std::string out(static_cast<std::size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(),
+                        static_cast<int>(wide.size()), out.data(), size,
+                        nullptr, nullptr);
+    return out;
+}
+
+bool copy_utf8_to_clipboard(HWND owner, const std::string& utf8) {
+    const std::wstring wide = wide_from_utf8_lossy(utf8);
+    if (!OpenClipboard(owner)) {
+        return false;
+    }
+    struct ClipboardCloser {
+        ~ClipboardCloser() { CloseClipboard(); }
+    } closer;
+    if (!EmptyClipboard()) {
+        return false;
+    }
+    const std::size_t bytes = (wide.size() + 1) * sizeof(wchar_t);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (mem == nullptr) {
+        return false;
+    }
+    void* dst = GlobalLock(mem);
+    if (dst == nullptr) {
+        GlobalFree(mem);
+        return false;
+    }
+    std::memcpy(dst, wide.c_str(), bytes);
+    GlobalUnlock(mem);
+    if (SetClipboardData(CF_UNICODETEXT, mem) == nullptr) {
+        GlobalFree(mem);
+        return false;
+    }
+    return true;
+}
+
+std::optional<std::string> try_clipboard_share_code(HWND owner) {
+    const auto clipText = WindowsTrayShell::read_clipboard_utf16(owner);
+    if (!clipText.has_value() || clipText->size() > 24) {
+        return std::nullopt;
+    }
+    std::string utf8;
+    utf8.reserve(clipText->size());
+    for (char16_t ch : *clipText) {
+        if (ch > 0x7F) {
+            return std::nullopt;
+        }
+        utf8.push_back(static_cast<char>(ch));
+    }
+    try {
+        std::string normalized =
+            WindowsPlatformProfileClient::normalize_share_code(utf8);
+        if (normalized.size() >= 6 && normalized.size() <= 12) {
+            return normalized;
+        }
+    } catch (const ReaderError&) {
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+struct ShareCodeDialogState {
+    HWND editHwnd = nullptr;
+    bool accepted = false;
+    bool done = false;
+    std::string code;
+};
+
+LRESULT CALLBACK share_code_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam,
+                                         LPARAM lParam) {
+    auto* state = reinterpret_cast<ShareCodeDialogState*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_NCCREATE: {
+        const auto* cs = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+        return TRUE;
+    }
+    case WM_COMMAND:
+        if (state != nullptr) {
+            const int id = LOWORD(wParam);
+            if (id == IDOK) {
+                wchar_t buf[64]{};
+                if (state->editHwnd != nullptr) {
+                    GetWindowTextW(state->editHwnd, buf,
+                                   static_cast<int>(std::size(buf)));
+                }
+                state->code = utf8_from_wide(buf);
+                state->accepted = true;
+                state->done = true;
+                return 0;
+            }
+            if (id == IDCANCEL) {
+                state->accepted = false;
+                state->done = true;
+                return 0;
+            }
+        }
+        break;
+    case WM_CLOSE:
+        if (state != nullptr) {
+            state->accepted = false;
+            state->done = true;
+            return 0;
+        }
+        break;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+std::optional<std::string> prompt_share_code_dialog(
+    HWND parent, const std::string& initialCode) {
+    constexpr wchar_t kPromptClassName[] = L"DyslexiaReader.ShareCodePrompt";
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = &share_code_dialog_proc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.lpszClassName = kPromptClassName;
+    if (RegisterClassExW(&wc) == 0 &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return std::nullopt;
+    }
+
+    constexpr int kDlgW = 390;
+    constexpr int kDlgH = 165;
+    int x = CW_USEDEFAULT;
+    int y = CW_USEDEFAULT;
+    RECT parentRect{};
+    if (parent != nullptr && GetWindowRect(parent, &parentRect)) {
+        x = parentRect.left + ((parentRect.right - parentRect.left - kDlgW) / 2);
+        y = parentRect.top + ((parentRect.bottom - parentRect.top - kDlgH) / 2);
+    }
+
+    ShareCodeDialogState state;
+    HWND dlg = CreateWindowExW(
+        WS_EX_DLGMODALFRAME, kPromptClassName, L"Import Profile by Share Code",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, kDlgW, kDlgH, parent, nullptr,
+        instance, &state);
+    if (dlg == nullptr) {
+        return std::nullopt;
+    }
+
+    auto guiFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    auto applyFont = [guiFont](HWND child) {
+        if (child != nullptr && guiFont != nullptr) {
+            SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont),
+                         FALSE);
+        }
+    };
+
+    HWND label = CreateWindowExW(
+        0, L"STATIC",
+        L"Enter the Platform share code from the Web Playground:",
+        WS_CHILD | WS_VISIBLE, 16, 16, 344, 20, dlg, nullptr, instance, nullptr);
+    applyFont(label);
+
+    const std::wstring initialWide = wide_from_utf8_lossy(initialCode);
+    state.editHwnd = CreateWindowExW(
+        WS_EX_CLIENTEDGE, L"EDIT", initialWide.c_str(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_UPPERCASE,
+        16, 42, 342, 26, dlg, reinterpret_cast<HMENU>(101), instance, nullptr);
+    applyFont(state.editHwnd);
+
+    HWND okBtn = CreateWindowExW(
+        0, L"BUTTON", L"Import",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 186, 84, 82, 28,
+        dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), instance,
+        nullptr);
+    applyFont(okBtn);
+
+    HWND cancelBtn = CreateWindowExW(
+        0, L"BUTTON", L"Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 276, 84, 82, 28,
+        dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), instance,
+        nullptr);
+    applyFont(cancelBtn);
+
+    const bool parentWasEnabled =
+        parent != nullptr && IsWindowEnabled(parent) != FALSE;
+    if (parentWasEnabled) {
+        EnableWindow(parent, FALSE);
+    }
+
+    ShowWindow(dlg, SW_SHOWNORMAL);
+    UpdateWindow(dlg);
+    if (state.editHwnd != nullptr) {
+        SetFocus(state.editHwnd);
+        SendMessageW(state.editHwnd, EM_SETSEL, 0, -1);
+    }
+
+    MSG msg{};
+    bool rePostQuit = false;
+    WPARAM quitCode = 0;
+    while (!state.done) {
+        const BOOL res = GetMessageW(&msg, nullptr, 0, 0);
+        if (res <= 0) {
+            if (res == 0) {
+                rePostQuit = true;
+                quitCode = msg.wParam;
+            }
+            break;
+        }
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    if (parentWasEnabled) {
+        EnableWindow(parent, TRUE);
+    }
+    DestroyWindow(dlg);
+    if (parent != nullptr) {
+        SetForegroundWindow(parent);
+    }
+    if (rePostQuit) {
+        PostQuitMessage(static_cast<int>(quitCode));
+    }
+    if (!state.accepted) {
+        return std::nullopt;
+    }
+    return state.code;
+}
+
 class AppCoordinator final {
 public:
     AppCoordinator(Direct2DTextRenderer& renderer,
                    WindowsScreenCapturer& capturer,
                    TesseractOcrEngine& ocrEngine,
                    ParagraphRebuilder& rebuilder,
-                   WindowsTrayShell& tray)
+                   WindowsTrayShell& tray,
+                   JsonReadingProfileStore& profileStore)
         : renderer_(renderer),
           capturer_(capturer),
           ocrEngine_(ocrEngine),
           rebuilder_(rebuilder),
-          tray_(tray) {}
+          tray_(tray),
+          profileStore_(profileStore) {}
 
     ~AppCoordinator() { shutdown(); }
 
@@ -163,6 +413,151 @@ public:
         show_and_focus_reader();
     }
 
+    void open_word_cloud() {
+        const auto items = build_word_cloud(renderer_.document(), 45);
+        wordCloudWindow_.show(
+            renderer_.hwnd(), renderer_.profile().theme, items,
+            [this](std::size_t wordIndex, const std::string& word) {
+                renderer_.select_word_at_index(wordIndex);
+                show_and_focus_reader();
+                define_word_text(word);
+            });
+    }
+
+    void define_selected_word() {
+        const auto selected = renderer_.selected_word_utf8();
+        if (!selected.has_value()) {
+            tray_.show_notification(
+                L"Dyslexia Reader",
+                L"Click a word (or right-click any word) to look it up.",
+                false);
+            return;
+        }
+        define_word_text(*selected);
+    }
+
+    void define_word_text(const std::string& word) {
+        wordDefWindow_.show_word(
+            renderer_.hwnd(), renderer_.profile().theme, word,
+            [this](const std::string& spoken) {
+                renderer_.speak_text_utf8(spoken);
+            });
+    }
+
+    void sync_insight_themes(ThemeId theme) {
+        wordCloudWindow_.update_theme(theme);
+        wordDefWindow_.update_theme(theme);
+    }
+
+    void open_web_playground() {
+        const std::wstring url =
+            WindowsPlatformProfileClient::default_web_playground_url();
+        const HINSTANCE result = ShellExecuteW(
+            renderer_.hwnd(), L"open", url.c_str(), nullptr, nullptr,
+            SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(result) <= 32) {
+            tray_.show_notification(
+                L"Dyslexia Reader",
+                L"Could not open the Dyslexia Web Playground in your browser.",
+                true);
+        }
+    }
+
+    void share_profile_to_platform() {
+        if (platformBusy_.exchange(true)) {
+            tray_.show_notification(
+                L"Dyslexia Reader",
+                L"Platform sync is already in progress.", false);
+            return;
+        }
+        if (platformThread_.joinable()) {
+            platformThread_.join();
+        }
+        const ReadingProfile snapshot = renderer_.profile();
+        tray_.show_notification(
+            L"Dyslexia Reader",
+            L"Sharing current reading profile to Platform...", false);
+
+        platformThread_ = std::thread([this, snapshot]() {
+            PlatformSyncResult result;
+            result.kind = PlatformSyncResult::Kind::Share;
+            try {
+                WindowsPlatformProfileClient client;
+                result.shareCode = client.share_profile(snapshot);
+            } catch (const std::exception& error) {
+                result.errorMessage = error.what();
+            }
+            {
+                std::scoped_lock lock(platformMutex_);
+                pendingPlatformResult_ = std::move(result);
+            }
+            if (!shuttingDown_.load() && hwnd_ != nullptr) {
+                PostMessageW(hwnd_, kMsgPlatformCompleted, 0, 0);
+            } else {
+                platformBusy_.store(false);
+            }
+        });
+    }
+
+    void import_profile_by_share_code() {
+        if (platformBusy_.load()) {
+            tray_.show_notification(
+                L"Dyslexia Reader",
+                L"Platform sync is already in progress.", false);
+            return;
+        }
+        const std::string initialCode =
+            try_clipboard_share_code(renderer_.hwnd()).value_or("");
+        const auto entered =
+            prompt_share_code_dialog(renderer_.hwnd(), initialCode);
+        if (!entered.has_value()) {
+            return;
+        }
+
+        std::string normalizedCode;
+        try {
+            normalizedCode =
+                WindowsPlatformProfileClient::normalize_share_code(*entered);
+        } catch (const std::exception& error) {
+            MessageBoxW(renderer_.hwnd(),
+                        wide_from_utf8_lossy(error.what()).c_str(),
+                        L"Invalid Share Code", MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        if (platformBusy_.exchange(true)) {
+            return;
+        }
+        if (platformThread_.joinable()) {
+            platformThread_.join();
+        }
+        tray_.show_notification(
+            L"Dyslexia Reader",
+            L"Downloading reading profile from Platform...", false);
+
+        platformThread_ = std::thread([this, normalizedCode]() {
+            PlatformSyncResult result;
+            result.kind = PlatformSyncResult::Kind::Import;
+            result.shareCode = normalizedCode;
+            try {
+                WindowsPlatformProfileClient client;
+                result.importedProfile =
+                    client.fetch_shared_profile(normalizedCode);
+            } catch (const std::exception& error) {
+                result.errorMessage = error.what();
+            }
+            {
+                std::scoped_lock lock(platformMutex_);
+                pendingPlatformResult_ = std::move(result);
+            }
+            if (!shuttingDown_.load() && hwnd_ != nullptr) {
+                PostMessageW(hwnd_, kMsgPlatformCompleted, 0, 0);
+            } else {
+                platformBusy_.store(false);
+            }
+        });
+    }
+
     void show_and_focus_reader() {
         renderer_.show(SW_SHOW);
         if (renderer_.hwnd() != nullptr) {
@@ -172,8 +567,13 @@ public:
 
     void shutdown() noexcept {
         shuttingDown_.store(true);
+        wordDefWindow_.close();
+        wordCloudWindow_.close();
         if (ocrThread_.joinable()) {
             ocrThread_.join();
+        }
+        if (platformThread_.joinable()) {
+            platformThread_.join();
         }
         if (hwnd_ != nullptr) {
             DestroyWindow(hwnd_);
@@ -213,6 +613,9 @@ private:
             return 0;
         case kMsgOcrCompleted:
             finish_ocr_workflow(static_cast<std::uint64_t>(wParam));
+            return 0;
+        case kMsgPlatformCompleted:
+            finish_platform_workflow();
             return 0;
         default:
             return DefWindowProcW(hwnd_, msg, wParam, lParam);
@@ -340,11 +743,78 @@ private:
         show_and_focus_reader();
     }
 
+    void finish_platform_workflow() {
+        std::optional<PlatformSyncResult> result;
+        {
+            std::scoped_lock lock(platformMutex_);
+            result = std::move(pendingPlatformResult_);
+            pendingPlatformResult_.reset();
+        }
+        platformBusy_.store(false);
+        if (!result.has_value()) {
+            return;
+        }
+        if (!result->errorMessage.empty()) {
+            const std::wstring details = wide_from_utf8_lossy(result->errorMessage);
+            tray_.show_notification(L"Platform Sync Unavailable", details, true);
+            MessageBoxW(renderer_.hwnd(), details.c_str(),
+                        L"Platform Sync Unavailable", MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        if (result->kind == PlatformSyncResult::Kind::Share) {
+            const bool copied =
+                copy_utf8_to_clipboard(renderer_.hwnd(), result->shareCode);
+            const std::wstring wideCode = wide_from_utf8_lossy(result->shareCode);
+            const std::wstring msg =
+                L"Share Code: " + wideCode +
+                (copied ? L"\n\nCopied to clipboard. Use \"Load Code\" in the "
+                          L"Dyslexia Web Playground to open this profile."
+                        : L"\n\nUse \"Load Code\" in the Dyslexia Web "
+                          L"Playground to open this profile.");
+            tray_.show_notification(
+                L"Profile Shared",
+                L"Share code " + wideCode +
+                    (copied ? L" copied to clipboard." : L" generated."),
+                false);
+            MessageBoxW(renderer_.hwnd(), msg.c_str(),
+                        L"Profile Shared to Platform",
+                        MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+
+        if (result->importedProfile.has_value()) {
+            renderer_.set_profile(*result->importedProfile);
+            try {
+                profileStore_.save(*result->importedProfile);
+            } catch (const std::exception& error) {
+                OutputDebugStringA("Profile save warning: ");
+                OutputDebugStringA(error.what());
+                OutputDebugStringA("\n");
+            }
+            show_and_focus_reader();
+            tray_.show_notification(
+                L"Profile Imported",
+                L"Applied Platform share code " +
+                    wide_from_utf8_lossy(result->shareCode) + L".",
+                false);
+        }
+    }
+
+    struct PlatformSyncResult {
+        enum class Kind { Import, Share };
+        Kind kind = Kind::Import;
+        std::string shareCode;
+        std::optional<ReadingProfile> importedProfile;
+        std::string errorMessage;
+    };
+
     Direct2DTextRenderer& renderer_;
     WindowsScreenCapturer& capturer_;
     TesseractOcrEngine& ocrEngine_;
     ParagraphRebuilder& rebuilder_;
     WindowsTrayShell& tray_;
+    JsonReadingProfileStore& profileStore_;
 
     HWND hwnd_ = nullptr;
     bool captureActive_ = false;
@@ -354,6 +824,14 @@ private:
     std::mutex resultMutex_;
     std::optional<OcrJobResult> pendingResult_;
     std::thread ocrThread_;
+    std::atomic_bool platformBusy_{false};
+    std::mutex platformMutex_;
+    std::optional<PlatformSyncResult> pendingPlatformResult_;
+    std::thread platformThread_;
+    std::shared_ptr<FastWordLookupClient> wordLookupClient_ =
+        std::make_shared<FastWordLookupClient>();
+    WordCloudWindow wordCloudWindow_;
+    WordDefinitionWindow wordDefWindow_{wordLookupClient_};
 };
 
 bool has_minimized_flag(PWSTR cmdLine) {
@@ -395,7 +873,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine,
         Direct2DTextRenderer renderer(fontLoader, speechEngine.get());
         WindowsTrayShell tray;
         AppCoordinator coordinator(renderer, capturer, ocrEngine, rebuilder,
-                                   tray);
+                                   tray, profileStore);
 
         if (!coordinator.create(instance)) {
             MessageBoxW(nullptr,
@@ -410,7 +888,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine,
         renderer.set_document(build_welcome_document());
 
         renderer.set_on_profile_changed(
-            [&profileStore](const ReadingProfile& updated) {
+            [&profileStore, &coordinator](const ReadingProfile& updated) {
+                coordinator.sync_insight_themes(updated.theme);
                 try {
                     profileStore.save(updated);
                 } catch (const std::exception& error) {
@@ -432,6 +911,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine,
             [&coordinator]() { coordinator.request_capture(); });
         renderer.set_on_clipboard_requested(
             [&coordinator]() { coordinator.read_clipboard(); });
+        renderer.set_on_import_share_code_requested(
+            [&coordinator]() { coordinator.import_profile_by_share_code(); });
+        renderer.set_on_share_profile_requested(
+            [&coordinator]() { coordinator.share_profile_to_platform(); });
+        renderer.set_on_open_web_playground_requested(
+            [&coordinator]() { coordinator.open_web_playground(); });
+        renderer.set_on_define_word_requested(
+            [&coordinator]() { coordinator.define_selected_word(); });
+        renderer.set_on_word_cloud_requested(
+            [&coordinator]() { coordinator.open_word_cloud(); });
 
         renderer.create_reader_window(instance);
 
@@ -447,6 +936,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine,
         };
         trayCallbacks.onToggleModeRequested = [&coordinator]() {
             coordinator.toggle_mode();
+        };
+        trayCallbacks.onImportShareCodeRequested = [&coordinator]() {
+            coordinator.import_profile_by_share_code();
+        };
+        trayCallbacks.onShareProfileRequested = [&coordinator]() {
+            coordinator.share_profile_to_platform();
+        };
+        trayCallbacks.onOpenWebPlaygroundRequested = [&coordinator]() {
+            coordinator.open_web_playground();
         };
         trayCallbacks.onExitRequested = []() { PostQuitMessage(0); };
         trayCallbacks.isReaderVisible = [&renderer]() {

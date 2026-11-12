@@ -18,13 +18,39 @@
 #include <string_view>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace DyslexiaReader::detail {
 namespace {
+
+#ifdef _WIN32
+std::filesystem::path executable_directory() {
+    std::vector<wchar_t> buffer(32768);
+    const DWORD written = GetModuleFileNameW(
+        nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (written == 0 || written >= buffer.size()) {
+        return {};
+    }
+    return std::filesystem::path(std::wstring(buffer.data(), written))
+        .parent_path();
+}
+#endif
 
 std::vector<std::string> tessdata_candidates() {
     namespace fs = std::filesystem;
     std::vector<std::string> candidates;
     const auto addIfValid = [&candidates](const fs::path& candidate) {
+        if (candidate.empty()) {
+            return;
+        }
         std::error_code ec;
         if (!fs::exists(candidate / "eng.traineddata", ec)) {
             return;
@@ -36,6 +62,13 @@ std::vector<std::string> tessdata_candidates() {
         }
     };
 
+#ifdef _WIN32
+    const fs::path exeDir = executable_directory();
+    if (!exeDir.empty()) {
+        addIfValid(exeDir / "tessdata");
+        addIfValid(exeDir.parent_path() / "tessdata");
+    }
+#endif
     addIfValid(fs::path(".") / "tessdata");
     addIfValid(fs::path("..") / "tessdata");
     addIfValid(fs::path(kBuildTessdataDir));

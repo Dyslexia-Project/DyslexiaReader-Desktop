@@ -211,11 +211,13 @@ if(WIN32)
         src/windows/reading_aids.cpp
         src/windows/speech_synthesizer.cpp
         src/windows/cloud_speech_client.cpp
+        src/windows/platform_profile_client.cpp
+        src/windows/word_insights.cpp
         src/windows/audio_cache.cpp
     )
     target_include_directories(dyslexia_reader_windows PUBLIC include PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_compile_features(dyslexia_reader_windows PUBLIC cxx_std_17)
-    target_compile_definitions(dyslexia_reader_windows PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00)
+    target_compile_definitions(dyslexia_reader_windows PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00 _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
     find_package(nlohmann_json CONFIG REQUIRED)
     target_sources(dyslexia_reader_windows PRIVATE
         src/windows/profile_store.cpp
@@ -243,4 +245,16 @@ if(WIN32)
     add_executable(windows_renderer_smoke tests/windows_renderer_smoke.cpp ${CMAKE_CURRENT_BINARY_DIR}/fonts.rc)
     target_link_libraries(windows_renderer_smoke PRIVATE dyslexia_reader_windows)
     add_test(NAME windows_renderer_smoke COMMAND windows_renderer_smoke)
+
+    add_executable(windows_cloud_speech_smoke tests/windows_cloud_speech_smoke.cpp)
+    target_link_libraries(windows_cloud_speech_smoke PRIVATE dyslexia_reader_windows)
+    add_test(NAME windows_cloud_speech_smoke COMMAND windows_cloud_speech_smoke)
+
+    add_executable(platform_profile_smoke tests/platform_profile_smoke.cpp)
+    target_link_libraries(platform_profile_smoke PRIVATE dyslexia_reader_windows)
+    add_test(NAME platform_profile_smoke COMMAND platform_profile_smoke)
+
+    add_executable(word_insights_smoke tests/word_insights_smoke.cpp)
+    target_link_libraries(word_insights_smoke PRIVATE dyslexia_reader_windows)
+    add_test(NAME word_insights_smoke COMMAND word_insights_smoke)
 endif()

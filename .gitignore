@@ -7,3 +7,4 @@
 # CMake / IDE build artifacts
 build/
 cmake-build-*/
+artifact/

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "dyslexia_reader/interfaces.hpp"
 #include "dyslexia_reader/windows/reading_aids.hpp"
@@ -57,8 +57,39 @@ public:
                          onClipboardRequested_ ? TRUE : FALSE);
         }
     }
+    void set_on_import_share_code_requested(std::function<void()> cb) {
+        onImportShareCodeRequested_ = std::move(cb);
+        sync_platform_button_state();
+    }
+    void set_on_share_profile_requested(std::function<void()> cb) {
+        onShareProfileRequested_ = std::move(cb);
+        sync_platform_button_state();
+    }
+    void set_on_open_web_playground_requested(std::function<void()> cb) {
+        onOpenWebPlaygroundRequested_ = std::move(cb);
+        sync_platform_button_state();
+    }
+    void set_on_define_word_requested(std::function<void()> cb) {
+        onDefineWordRequested_ = std::move(cb);
+        sync_toolbar_controls();
+    }
+    void set_on_word_cloud_requested(std::function<void()> cb) {
+        onWordCloudRequested_ = std::move(cb);
+        sync_toolbar_controls();
+    }
 
     void set_document(const ReadingDocument& document) override;
+    [[nodiscard]] const ReadingProfile& profile() const noexcept {
+        return profile_;
+    }
+    [[nodiscard]] const ReadingDocument& document() const noexcept {
+        return document_;
+    }
+    [[nodiscard]] std::optional<std::string> selected_word_utf8() const;
+    void select_word_at_index(std::size_t wordIndex);
+    void speak_selected_word();
+    void speak_text_utf8(const std::string& utf8Text);
+
     void set_profile(const ReadingProfile& profile) override;
     void set_viewport(const Viewport& viewport) override;
     TextLayoutSnapshot layout_snapshot() const override;
@@ -105,9 +136,11 @@ private:
     void move_word_cursor_line(int lineDelta);
     void clear_word_cursor();
     void start_speech_request(std::optional<TextRange> selection);
-    void speak_selected_word();
     void sync_ruler_to_word();
     void draw_word_cursor(bool underText) const;
+    void sync_platform_button_state() const;
+    void show_platform_menu();
+    void draw_toolbar_button(const DRAWITEMSTRUCT* dis) const;
     void rebuild_text_layout();
     void discard_device_resources() noexcept;
     void paint();
@@ -138,6 +171,9 @@ private:
     static constexpr int kLineWidthControlId = 1016;
     static constexpr int kClipboardControlId = 1017;
     static constexpr int kSpeakWordControlId = 1018;
+    static constexpr int kPlatformControlId = 1019;
+    static constexpr int kDefineWordControlId = 1020;
+    static constexpr int kWordCloudControlId = 1021;
     static constexpr UINT kSpeechEventMessage = WM_APP + 0x31;
 
     struct SpeechDispatchState {
@@ -184,6 +220,7 @@ private:
     PlaybackState speechState_ = PlaybackState::Idle;
     float speechRate_ = 1.0F;
     bool speechAvailable_ = false;
+    bool speechTracksDocument_ = true;
     std::optional<std::uint32_t> activeVisualLine_;
     std::optional<TextOffset> rulerAnchorOffset_;
     std::optional<std::size_t> selectedWordIndex_;
@@ -208,16 +245,20 @@ private:
     HWND speechPlayButton_ = nullptr;
     HWND speechStopButton_ = nullptr;
     HWND speakWordButton_ = nullptr;
+    HWND defineWordButton_ = nullptr;
+    HWND wordCloudButton_ = nullptr;
     HWND speechRateTrackbar_ = nullptr;
     HWND speechRateLabel_ = nullptr;
     HWND focusModeButton_ = nullptr;
     HWND captureButton_ = nullptr;
     HWND clipboardButton_ = nullptr;
+    HWND platformButton_ = nullptr;
     HWND lineWidthTrackbar_ = nullptr;
     HWND lineWidthLabel_ = nullptr;
     HWND shortcutHintLabel_ = nullptr;
 
     HFONT uiFont_ = nullptr;
+    HANDLE gdiUiFontResource_ = nullptr;
     HBRUSH toolbarBrush_ = nullptr;
     ThemeId themedBrushId_ = ThemeId::WarmCream;
     bool hasThemedBrush_ = false;
@@ -232,6 +273,11 @@ private:
     std::function<void(ReaderMode)> onModeChanged_;
     std::function<void()> onCaptureRequested_;
     std::function<void()> onClipboardRequested_;
+    std::function<void()> onImportShareCodeRequested_;
+    std::function<void()> onShareProfileRequested_;
+    std::function<void()> onOpenWebPlaygroundRequested_;
+    std::function<void()> onDefineWordRequested_;
+    std::function<void()> onWordCloudRequested_;
 
     std::pair<float, float> text_column_metrics() const;
     float content_height_dip() const;

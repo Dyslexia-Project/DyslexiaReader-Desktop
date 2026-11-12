@@ -22,6 +22,9 @@ struct TrayCallbacks {
     std::function<void()> onClipboardRequested;
     std::function<void()> onToggleVisibilityRequested;
     std::function<void()> onToggleModeRequested;
+    std::function<void()> onImportShareCodeRequested;
+    std::function<void()> onShareProfileRequested;
+    std::function<void()> onOpenWebPlaygroundRequested;
     std::function<void()> onExitRequested;
     std::function<bool()> isReaderVisible;
     std::function<ReaderMode()> currentMode;

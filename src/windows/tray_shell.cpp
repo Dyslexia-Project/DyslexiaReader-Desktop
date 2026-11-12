@@ -22,6 +22,9 @@ constexpr UINT kCmdReadClipboard = 4002;
 constexpr UINT kCmdToggleVisibility = 4003;
 constexpr UINT kCmdToggleMode = 4004;
 constexpr UINT kCmdExit = 4005;
+constexpr UINT kCmdImportShareCode = 4006;
+constexpr UINT kCmdShareProfile = 4007;
+constexpr UINT kCmdOpenWebPlayground = 4008;
 
 struct HotkeySpec {
     int id;
@@ -204,6 +207,13 @@ void WindowsTrayShell::show_context_menu() const {
                 mode == ReaderMode::Focus ? L"Switch to Floating Mode"
                                           : L"Switch to Focus Mode");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kCmdImportShareCode,
+                L"Import Profile by Share Code...");
+    AppendMenuW(menu, MF_STRING, kCmdShareProfile,
+                L"Share Profile to Platform");
+    AppendMenuW(menu, MF_STRING, kCmdOpenWebPlayground,
+                L"Open Web Playground");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCmdExit, L"Exit");
 
     POINT cursor{};
@@ -234,6 +244,21 @@ void WindowsTrayShell::show_context_menu() const {
     case kCmdToggleMode:
         if (callbacks_.onToggleModeRequested) {
             callbacks_.onToggleModeRequested();
+        }
+        break;
+    case kCmdImportShareCode:
+        if (callbacks_.onImportShareCodeRequested) {
+            callbacks_.onImportShareCodeRequested();
+        }
+        break;
+    case kCmdShareProfile:
+        if (callbacks_.onShareProfileRequested) {
+            callbacks_.onShareProfileRequested();
+        }
+        break;
+    case kCmdOpenWebPlayground:
+        if (callbacks_.onOpenWebPlaygroundRequested) {
+            callbacks_.onOpenWebPlaygroundRequested();
         }
         break;
     case kCmdExit:
