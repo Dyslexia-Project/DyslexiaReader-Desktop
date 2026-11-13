@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "dyslexia_reader/interfaces.hpp"
 #include "dyslexia_reader/windows/reading_aids.hpp"
@@ -256,6 +256,7 @@ private:
     HWND lineWidthTrackbar_ = nullptr;
     HWND lineWidthLabel_ = nullptr;
     HWND shortcutHintLabel_ = nullptr;
+    HWND readingStatsLabel_ = nullptr;
 
     HFONT uiFont_ = nullptr;
     HANDLE gdiUiFontResource_ = nullptr;

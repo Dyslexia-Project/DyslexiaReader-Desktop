@@ -1,4 +1,4 @@
-﻿#include "dyslexia_reader/windows/direct2d_text_renderer.hpp"
+#include "dyslexia_reader/windows/direct2d_text_renderer.hpp"
 #include "dyslexia_reader/windows/in_memory_font_collection.hpp"
 #include "theme_palette.hpp"
 
@@ -1068,12 +1068,15 @@ void Direct2DTextRenderer::paint_toolbar(HDC hdc,
     const int div2X = static_cast<int>(scale_dip(552, dpiX_));
     MoveToEx(hdc, div2X, static_cast<int>(scale_dip(50, dpiY_)), nullptr);
     LineTo(hdc, div2X, static_cast<int>(scale_dip(72, dpiY_)));
-    const int div3X = static_cast<int>(scale_dip(418, dpiX_));
+    const int div3X = static_cast<int>(scale_dip(392, dpiX_));
     MoveToEx(hdc, div3X, static_cast<int>(scale_dip(88, dpiY_)), nullptr);
     LineTo(hdc, div3X, static_cast<int>(scale_dip(112, dpiY_)));
-    const int div4X = static_cast<int>(scale_dip(586, dpiX_));
+    const int div4X = static_cast<int>(scale_dip(551, dpiX_));
     MoveToEx(hdc, div4X, static_cast<int>(scale_dip(88, dpiY_)), nullptr);
     LineTo(hdc, div4X, static_cast<int>(scale_dip(112, dpiY_)));
+    const int div5X = static_cast<int>(scale_dip(696, dpiX_));
+    MoveToEx(hdc, div5X, static_cast<int>(scale_dip(88, dpiY_)), nullptr);
+    LineTo(hdc, div5X, static_cast<int>(scale_dip(112, dpiY_)));
     const int rowSep1Y = static_cast<int>(scale_dip(43, dpiY_));
     MoveToEx(hdc, static_cast<int>(scale_dip(12, dpiX_)), rowSep1Y, nullptr);
     LineTo(hdc, client.right - static_cast<int>(scale_dip(12, dpiX_)), rowSep1Y);
@@ -1597,6 +1600,9 @@ void Direct2DTextRenderer::create_toolbar_controls() {
         create(L"STATIC",
                L"D / R-Click: define  \x2022  Enter: speak  \x2022  Ctrl+Shift+R: capture",
                SS_RIGHT | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
+    readingStatsLabel_ =
+        create(L"STATIC", L"0 words",
+               SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
     SendMessageW(speechRateTrackbar_, TBM_SETRANGE, TRUE,
                  MAKELONG(50, 200));
     SendMessageW(speechRateTrackbar_, TBM_SETPOS, TRUE, 100);
@@ -1658,7 +1664,7 @@ void Direct2DTextRenderer::layout_toolbar_controls() {
         static_cast<float>(client.right - client.left) * 96.0F /
             static_cast<float>(effDpiX));
 
-    HDWP deferPos = BeginDeferWindowPos(30);
+    HDWP deferPos = BeginDeferWindowPos(31);
     const auto move = [this, &deferPos](HWND control, float x, float y,
                                         float width, float height) {
         if (control == nullptr) {
@@ -1711,17 +1717,21 @@ void Direct2DTextRenderer::layout_toolbar_controls() {
     move(bimodalHighlightingCheckBox_, 764, 50, 96, 22);
 
     // Row 3: Offline speech controls + right-aligned shortcut hint.
-    move(speechVoiceLabel_, 16, 88, 40, 24);
-    move(speechVoiceCombo_, 58, 86, 152, 220);
-    move(speechPlayButton_, 216, 86, 60, 28);
-    move(speakWordButton_, 280, 86, 82, 28);
-    move(speechStopButton_, 366, 86, 48, 28);
-    move(defineWordButton_, 422, 86, 66, 28);
-    move(wordCloudButton_, 492, 86, 90, 28);
-    move(speechRateLabel_, 590, 88, 66, 24);
-    move(speechRateTrackbar_, 658, 86, 78, 26);
-    move(shortcutHintLabel_, 744, 90,
-         std::max(120.0F, clientWidthDip - 760.0F), 20);
+    move(speechVoiceLabel_, 16, 88, 38, 24);
+    move(speechVoiceCombo_, 56, 86, 142, 220);
+    move(speechPlayButton_, 202, 86, 56, 28);
+    move(speakWordButton_, 262, 86, 78, 28);
+    move(speechStopButton_, 344, 86, 46, 28);
+    move(defineWordButton_, 394, 86, 64, 28);
+    move(wordCloudButton_, 462, 86, 86, 28);
+    move(speechRateLabel_, 554, 88, 64, 24);
+    move(speechRateTrackbar_, 620, 86, 72, 26);
+    move(readingStatsLabel_, 700, 88, 175, 24);
+    move(shortcutHintLabel_, 884, 90,
+         std::max(60.0F, clientWidthDip - 900.0F), 20);
+    if (shortcutHintLabel_ != nullptr) {
+        ShowWindow(shortcutHintLabel_, clientWidthDip >= 960.0F ? SW_SHOW : SW_HIDE);
+    }
     if (deferPos != nullptr) {
         EndDeferWindowPos(deferPos);
     }
@@ -1859,6 +1869,30 @@ void Direct2DTextRenderer::sync_toolbar_controls() {
                          : FALSE);
     }
     EnableWindow(speechRateTrackbar_, speechAvailable_ ? TRUE : FALSE);
+    if (readingStatsLabel_ != nullptr) {
+        const std::size_t wordCount = document_.words.size();
+        std::wostringstream stats;
+        if (wordCount == 0) {
+            stats << L"0 words";
+        } else {
+            if (selectedWordIndex_.has_value() &&
+                *selectedWordIndex_ < wordCount) {
+                stats << L"Word " << (*selectedWordIndex_ + 1) << L"/"
+                      << wordCount << L"  \x2022  ";
+            } else {
+                stats << wordCount
+                      << (wordCount == 1 ? L" word  \x2022  " : L" words  \x2022  ");
+            }
+            const double mins = static_cast<double>(wordCount) / 130.0;
+            if (mins < 0.8) {
+                stats << L"< 1 min read";
+            } else {
+                stats << L"~" << std::fixed << std::setprecision(1) << mins
+                      << L" min read";
+            }
+        }
+        SetWindowTextW(readingStatsLabel_, stats.str().c_str());
+    }
 }
 
 void Direct2DTextRenderer::sync_platform_button_state() const {
