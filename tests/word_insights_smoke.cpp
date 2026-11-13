@@ -101,6 +101,40 @@ int main() {
         CHECK(syns[1] == "simplicity");
     }
 
+    // 5. Browser-style multiple tab support (preserving starting word).
+    {
+        auto client = std::make_shared<FastWordLookupClient>();
+        WordDefinitionWindow win(client);
+        CHECK(win.tab_count() == 0);
+
+        // Open starting word in Tab 0
+        win.open_tab("clarity");
+        CHECK(win.tab_count() == 1);
+        CHECK(win.active_tab_index() == 0);
+        CHECK(win.active_word() == "clarity");
+
+        // Click synonym to open in Tab 1
+        win.open_tab("lucidity");
+        CHECK(win.tab_count() == 2);
+        CHECK(win.active_tab_index() == 1);
+        CHECK(win.active_word() == "lucidity");
+
+        // Switch back to Tab 0: starting word is preserved!
+        win.select_tab(0);
+        CHECK(win.active_tab_index() == 0);
+        CHECK(win.active_word() == "clarity");
+
+        // Re-requesting starting word switches to Tab 0 without duplicating tabs
+        win.open_tab("clarity");
+        CHECK(win.tab_count() == 2);
+        CHECK(win.active_tab_index() == 0);
+
+        // Close Tab 1
+        win.close_tab(1);
+        CHECK(win.tab_count() == 1);
+        CHECK(win.active_word() == "clarity");
+    }
+
     std::cout << "word_insights_smoke: ALL CHECKS PASSED\n";
     return 0;
 }

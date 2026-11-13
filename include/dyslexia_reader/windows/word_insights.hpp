@@ -116,10 +116,32 @@ public:
 
     void show_word(HWND owner, ThemeId theme, const std::string& rawWord,
                    SpeakWordCallback onSpeakWord);
+    void open_tab(const std::string& rawWord);
+    void close_tab(std::size_t index);
+    void select_tab(std::size_t index);
+    [[nodiscard]] std::size_t tab_count() const noexcept;
+    [[nodiscard]] std::size_t active_tab_index() const noexcept;
+    [[nodiscard]] std::string active_word() const;
     void update_theme(ThemeId theme);
     void close();
 
 private:
+    struct DefinitionTab {
+        std::string queryWord;
+        std::string title;
+        WordLookupResult result;
+        bool loading = false;
+        int scrollY = 0;
+        int contentHeight = 0;
+        std::uint64_t requestSeq = 0;
+    };
+
+    struct TabHeaderLayout {
+        std::size_t tabIndex = 0;
+        RECT tabBounds{};
+        RECT closeBounds{};
+    };
+
     struct SynonymPill {
         std::string word;
         RECT bounds{};
@@ -128,7 +150,8 @@ private:
     static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam,
                                      LPARAM lParam);
     LRESULT handle_message(UINT msg, WPARAM wParam, LPARAM lParam);
-    void start_lookup(const std::string& rawWord);
+    void start_lookup_for_tab(std::size_t tabIndex, const std::string& rawWord);
+    void open_new_empty_tab();
     void layout_controls();
     void update_scroll_bar();
     void paint_canvas(HDC hdc, const RECT& clientRect);
@@ -137,6 +160,7 @@ private:
         std::mutex mutex;
         bool alive = true;
         std::uint64_t seq = 0;
+        std::size_t tabIndex = 0;
         WordLookupResult result;
     };
 
@@ -151,14 +175,18 @@ private:
 
     ThemeId theme_ = ThemeId::WarmCream;
     SpeakWordCallback onSpeakWord_;
-    std::string activeWord_;
-    bool loading_ = false;
     std::uint64_t requestSeq_ = 0;
-    WordLookupResult result_;
+
+    std::vector<DefinitionTab> tabs_;
+    std::size_t activeTabIndex_ = 0;
+    std::vector<TabHeaderLayout> tabHeaders_;
+    RECT newTabBounds_{};
+    int hoveredTab_ = -1;
+    int hoveredClose_ = -1;
+    bool hoveredNewTab_ = false;
+
     std::vector<SynonymPill> synonymPills_;
     int hoveredPill_ = -1;
-    int scrollY_ = 0;
-    int contentHeight_ = 0;
 };
 
 }  // namespace dyslexia_reader::windows

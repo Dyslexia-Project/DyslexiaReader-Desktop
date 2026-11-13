@@ -1071,10 +1071,10 @@ void Direct2DTextRenderer::paint_toolbar(HDC hdc,
     const int div3X = static_cast<int>(scale_dip(392, dpiX_));
     MoveToEx(hdc, div3X, static_cast<int>(scale_dip(88, dpiY_)), nullptr);
     LineTo(hdc, div3X, static_cast<int>(scale_dip(112, dpiY_)));
-    const int div4X = static_cast<int>(scale_dip(551, dpiX_));
+    const int div4X = static_cast<int>(scale_dip(600, dpiX_));
     MoveToEx(hdc, div4X, static_cast<int>(scale_dip(88, dpiY_)), nullptr);
     LineTo(hdc, div4X, static_cast<int>(scale_dip(112, dpiY_)));
-    const int div5X = static_cast<int>(scale_dip(696, dpiX_));
+    const int div5X = static_cast<int>(scale_dip(740, dpiX_));
     MoveToEx(hdc, div5X, static_cast<int>(scale_dip(88, dpiY_)), nullptr);
     LineTo(hdc, div5X, static_cast<int>(scale_dip(112, dpiY_)));
     const int rowSep1Y = static_cast<int>(scale_dip(43, dpiY_));
@@ -1586,7 +1586,7 @@ void Direct2DTextRenderer::create_toolbar_controls() {
         create(L"BUTTON", L"Stop", BS_OWNERDRAW | WS_TABSTOP,
                kSpeechStopControlId);
     defineWordButton_ =
-        create(L"BUTTON", L"Define", BS_OWNERDRAW | WS_TABSTOP,
+        create(L"BUTTON", L"Define & Syns (D)", BS_OWNERDRAW | WS_TABSTOP,
                kDefineWordControlId);
     wordCloudButton_ =
         create(L"BUTTON", L"Word Cloud", BS_OWNERDRAW | WS_TABSTOP,
@@ -1598,7 +1598,7 @@ void Direct2DTextRenderer::create_toolbar_controls() {
                kSpeechRateControlId);
     shortcutHintLabel_ =
         create(L"STATIC",
-               L"D / R-Click: define  \x2022  Enter: speak  \x2022  Ctrl+Shift+R: capture",
+               L"Right-Click / D: Define & Syns  \x2022  Enter: speak  \x2022  Ctrl+Shift+R: capture",
                SS_RIGHT | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
     readingStatsLabel_ =
         create(L"STATIC", L"0 words",
@@ -1722,15 +1722,15 @@ void Direct2DTextRenderer::layout_toolbar_controls() {
     move(speechPlayButton_, 202, 86, 56, 28);
     move(speakWordButton_, 262, 86, 78, 28);
     move(speechStopButton_, 344, 86, 46, 28);
-    move(defineWordButton_, 394, 86, 64, 28);
-    move(wordCloudButton_, 462, 86, 86, 28);
-    move(speechRateLabel_, 554, 88, 64, 24);
-    move(speechRateTrackbar_, 620, 86, 72, 26);
-    move(readingStatsLabel_, 700, 88, 175, 24);
-    move(shortcutHintLabel_, 884, 90,
-         std::max(60.0F, clientWidthDip - 900.0F), 20);
+    move(defineWordButton_, 394, 86, 110, 28);
+    move(wordCloudButton_, 508, 86, 86, 28);
+    move(speechRateLabel_, 600, 88, 62, 24);
+    move(speechRateTrackbar_, 666, 86, 68, 26);
+    move(readingStatsLabel_, 746, 88, 175, 24);
+    move(shortcutHintLabel_, 926, 90,
+         std::max(60.0F, clientWidthDip - 930.0F), 20);
     if (shortcutHintLabel_ != nullptr) {
-        ShowWindow(shortcutHintLabel_, clientWidthDip >= 960.0F ? SW_SHOW : SW_HIDE);
+        ShowWindow(shortcutHintLabel_, clientWidthDip >= 990.0F ? SW_SHOW : SW_HIDE);
     }
     if (deferPos != nullptr) {
         EndDeferWindowPos(deferPos);
@@ -1878,7 +1878,7 @@ void Direct2DTextRenderer::sync_toolbar_controls() {
             if (selectedWordIndex_.has_value() &&
                 *selectedWordIndex_ < wordCount) {
                 stats << L"Word " << (*selectedWordIndex_ + 1) << L"/"
-                      << wordCount << L"  \x2022  ";
+                      << wordCount << L" (R-Click/D: Define)  \x2022  ";
             } else {
                 stats << wordCount
                       << (wordCount == 1 ? L" word  \x2022  " : L" words  \x2022  ");

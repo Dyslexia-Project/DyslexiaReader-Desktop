@@ -1,4 +1,4 @@
-#include "dyslexia_reader/windows/word_insights.hpp"
+﻿#include "dyslexia_reader/windows/word_insights.hpp"
 #include "theme_palette.hpp"
 
 #include <winhttp.h>
@@ -37,7 +37,9 @@ constexpr int kQueryEditId = 2001;
 constexpr int kSearchBtnId = 2002;
 constexpr int kSpeakBtnId = 2003;
 constexpr int kCopyBtnId = 2004;
-constexpr int kTopBarHeight = 46;
+constexpr int kTabBarHeight = 32;
+constexpr int kToolBarHeight = 42;
+constexpr int kTopBarHeight = kTabBarHeight + kToolBarHeight;  // 74
 
 struct WinHttpHandle {
     HINTERNET handle = nullptr;
@@ -1048,6 +1050,21 @@ void WordDefinitionWindow::close() {
     }
 }
 
+std::size_t WordDefinitionWindow::tab_count() const noexcept {
+    return tabs_.size();
+}
+
+std::size_t WordDefinitionWindow::active_tab_index() const noexcept {
+    return activeTabIndex_;
+}
+
+std::string WordDefinitionWindow::active_word() const {
+    if (activeTabIndex_ < tabs_.size()) {
+        return tabs_[activeTabIndex_].queryWord;
+    }
+    return "";
+}
+
 void WordDefinitionWindow::show_word(HWND owner, ThemeId theme,
                                      const std::string& rawWord,
                                      SpeakWordCallback onSpeakWord) {
@@ -1068,15 +1085,16 @@ void WordDefinitionWindow::show_word(HWND owner, ThemeId theme,
     if (hwnd_ == nullptr || !IsWindow(hwnd_)) {
         int x = CW_USEDEFAULT;
         int y = CW_USEDEFAULT;
-        constexpr int kW = 520;
-        constexpr int kH = 460;
+        constexpr int kW = 580;
+        constexpr int kH = 500;
         RECT ownerRect{};
         if (owner != nullptr && GetWindowRect(owner, &ownerRect)) {
             x = ownerRect.right - kW - 24;
             y = ownerRect.top + 88;
         }
         hwnd_ = CreateWindowExW(
-            WS_EX_TOOLWINDOW, kClassName, L"Quick Definition & Synonyms",
+            WS_EX_TOOLWINDOW, kClassName,
+            L"Quick Definition & Synonyms — Tabbed Browser",
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VSCROLL,
             x, y, kW, kH, owner, nullptr, instance, this);
     }
@@ -1085,7 +1103,7 @@ void WordDefinitionWindow::show_word(HWND owner, ThemeId theme,
         update_theme(theme);
         ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
-        start_lookup(rawWord);
+        open_tab(rawWord);
     }
 }
 
@@ -1101,45 +1119,159 @@ void WordDefinitionWindow::update_theme(ThemeId theme) {
     }
 }
 
-void WordDefinitionWindow::start_lookup(const std::string& rawWord) {
+void WordDefinitionWindow::open_tab(const std::string& rawWord) {
     std::string cleaned = FastWordLookupClient::normalize_lookup_word(rawWord);
     if (cleaned.empty()) {
         cleaned = rawWord;
     }
-    activeWord_ = cleaned;
-    scrollY_ = 0;
-    hoveredPill_ = -1;
-    synonymPills_.clear();
-
-    if (queryEdit_ != nullptr) {
-        SetWindowTextW(queryEdit_, wide_from_utf8(activeWord_).c_str());
+    if (cleaned.empty()) {
+        open_new_empty_tab();
+        return;
     }
 
-    loading_ = true;
-    result_ = WordLookupResult{};
-    result_.word = activeWord_;
+    // Check if word is already open in an existing tab
+    for (std::size_t i = 0; i < tabs_.size(); ++i) {
+        if (tabs_[i].queryWord == cleaned) {
+            select_tab(i);
+            return;
+        }
+    }
+
+    // If current tab is empty, reuse it
+    if (!tabs_.empty() && tabs_[activeTabIndex_].queryWord.empty()) {
+        start_lookup_for_tab(activeTabIndex_, cleaned);
+        return;
+    }
+
+    // Add new tab (tab 0 remains intact so starting word is not lost)
+    DefinitionTab tab;
+    tab.queryWord = cleaned;
+    tab.title = cleaned;
+    tab.loading = true;
+    tab.result.word = cleaned;
+    tabs_.push_back(std::move(tab));
+    activeTabIndex_ = tabs_.size() - 1;
+
+    start_lookup_for_tab(activeTabIndex_, cleaned);
+    if (queryEdit_ != nullptr) {
+        SetWindowTextW(queryEdit_, wide_from_utf8(cleaned).c_str());
+    }
     update_scroll_bar();
+    if (hwnd_ != nullptr) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+void WordDefinitionWindow::open_new_empty_tab() {
+    DefinitionTab tab;
+    tab.queryWord = "";
+    tab.title = "New Tab";
+    tab.loading = false;
+    tabs_.push_back(std::move(tab));
+    activeTabIndex_ = tabs_.size() - 1;
+    synonymPills_.clear();
+    hoveredPill_ = -1;
+
+    if (queryEdit_ != nullptr) {
+        SetWindowTextW(queryEdit_, L"");
+        SetFocus(queryEdit_);
+    }
+    if (copyButton_ != nullptr) {
+        EnableWindow(copyButton_, FALSE);
+    }
+    update_scroll_bar();
+    if (hwnd_ != nullptr) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+void WordDefinitionWindow::select_tab(std::size_t index) {
+    if (index >= tabs_.size()) {
+        return;
+    }
+    activeTabIndex_ = index;
+    synonymPills_.clear();
+    hoveredPill_ = -1;
+    const auto& tab = tabs_[activeTabIndex_];
+    if (queryEdit_ != nullptr) {
+        SetWindowTextW(queryEdit_, wide_from_utf8(tab.queryWord).c_str());
+    }
+    if (copyButton_ != nullptr) {
+        EnableWindow(copyButton_, tab.result.synonyms.empty() ? FALSE : TRUE);
+    }
+    update_scroll_bar();
+    if (hwnd_ != nullptr) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+void WordDefinitionWindow::close_tab(std::size_t index) {
+    if (index >= tabs_.size()) {
+        return;
+    }
+    if (tabs_.size() > 1) {
+        tabs_.erase(tabs_.begin() + index);
+        if (activeTabIndex_ >= tabs_.size()) {
+            activeTabIndex_ = tabs_.size() - 1;
+        } else if (activeTabIndex_ > index) {
+            --activeTabIndex_;
+        }
+        select_tab(activeTabIndex_);
+    } else {
+        close();
+    }
+}
+
+void WordDefinitionWindow::start_lookup_for_tab(std::size_t tabIndex,
+                                                const std::string& rawWord) {
+    if (tabIndex >= tabs_.size()) {
+        return;
+    }
+    std::string cleaned = FastWordLookupClient::normalize_lookup_word(rawWord);
+    if (cleaned.empty()) {
+        cleaned = rawWord;
+    }
+    auto& tab = tabs_[tabIndex];
+    tab.queryWord = cleaned;
+    tab.title = cleaned;
+    tab.scrollY = 0;
+    tab.loading = true;
+    tab.result = WordLookupResult{};
+    tab.result.word = cleaned;
+
+    if (tabIndex == activeTabIndex_) {
+        synonymPills_.clear();
+        hoveredPill_ = -1;
+        if (queryEdit_ != nullptr) {
+            SetWindowTextW(queryEdit_, wide_from_utf8(tab.queryWord).c_str());
+        }
+        update_scroll_bar();
+    }
     if (hwnd_ != nullptr) {
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     const std::uint64_t seq = ++requestSeq_;
+    tab.requestSeq = seq;
     HWND target = hwnd_;
     std::shared_ptr<FastWordLookupClient> client = lookupClient_;
     std::shared_ptr<PendingState> shared = pendingState_;
-    std::thread([target, client, shared, seq, active = activeWord_]() {
-        WordLookupResult res = client ? client->lookup(active) : WordLookupResult{};
+    std::thread([target, client, shared, seq, tabIndex, active = cleaned]() {
+        WordLookupResult res =
+            client ? client->lookup(active) : WordLookupResult{};
         bool shouldPost = false;
         if (shared) {
             std::scoped_lock lock(shared->mutex);
             if (shared->alive) {
                 shared->seq = seq;
+                shared->tabIndex = tabIndex;
                 shared->result = std::move(res);
                 shouldPost = true;
             }
         }
         if (shouldPost && IsWindow(target)) {
-            PostMessageW(target, kMsgLookupReady, static_cast<WPARAM>(seq), 0);
+            PostMessageW(target, kMsgLookupReady, static_cast<WPARAM>(seq),
+                         static_cast<LPARAM>(tabIndex));
         }
     }).detach();
 }
@@ -1172,43 +1304,47 @@ void WordDefinitionWindow::layout_controls() {
     const int copyW = 104;
     const int speakW = 68;
     const int searchW = 68;
-    const int editW = std::max(100, width - 12 - 6 - searchW - 6 - speakW - 6 - copyW - 12);
+    const int editW =
+        std::max(100, width - 12 - 6 - searchW - 6 - speakW - 6 - copyW - 12);
 
+    const int ctrlY = kTabBarHeight + 7;
     int x = 12;
     if (queryEdit_ != nullptr) {
-        MoveWindow(queryEdit_, x, 10, editW, 26, TRUE);
+        MoveWindow(queryEdit_, x, ctrlY, editW, 26, TRUE);
     }
     x += editW + 6;
     if (searchButton_ != nullptr) {
-        MoveWindow(searchButton_, x, 9, searchW, 28, TRUE);
+        MoveWindow(searchButton_, x, ctrlY - 1, searchW, 28, TRUE);
     }
     x += searchW + 6;
     if (speakButton_ != nullptr) {
-        MoveWindow(speakButton_, x, 9, speakW, 28, TRUE);
+        MoveWindow(speakButton_, x, ctrlY - 1, speakW, 28, TRUE);
     }
     x += speakW + 6;
     if (copyButton_ != nullptr) {
-        MoveWindow(copyButton_, x, 9, copyW, 28, TRUE);
+        MoveWindow(copyButton_, x, ctrlY - 1, copyW, 28, TRUE);
     }
 }
 
 void WordDefinitionWindow::update_scroll_bar() {
-    if (hwnd_ == nullptr) {
+    if (hwnd_ == nullptr || activeTabIndex_ >= tabs_.size()) {
         return;
     }
     RECT rc{};
     GetClientRect(hwnd_, &rc);
-    const int viewH = std::max(1, static_cast<int>(rc.bottom - rc.top) - kTopBarHeight);
-    const int maxScroll = std::max(0, contentHeight_ - viewH);
-    scrollY_ = std::clamp(scrollY_, 0, maxScroll);
+    const int viewH =
+        std::max(1, static_cast<int>(rc.bottom - rc.top) - kTopBarHeight);
+    auto& curTab = tabs_[activeTabIndex_];
+    const int maxScroll = std::max(0, curTab.contentHeight - viewH);
+    curTab.scrollY = std::clamp(curTab.scrollY, 0, maxScroll);
 
     SCROLLINFO si{};
     si.cbSize = sizeof(si);
     si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
     si.nMin = 0;
-    si.nMax = std::max(0, contentHeight_ - 1);
+    si.nMax = std::max(0, curTab.contentHeight - 1);
     si.nPage = static_cast<UINT>(viewH);
-    si.nPos = scrollY_;
+    si.nPos = curTab.scrollY;
     SetScrollInfo(hwnd_, SB_VERT, &si, TRUE);
 }
 
@@ -1218,26 +1354,31 @@ LRESULT WordDefinitionWindow::handle_message(UINT msg, WPARAM wParam,
     case WM_CREATE: {
         HINSTANCE inst = GetModuleHandleW(nullptr);
         auto guiFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        const int ctrlY = kTabBarHeight + 7;
         queryEdit_ = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 12, 10, 180,
-            26, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kQueryEditId)),
-            inst, nullptr);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 12, ctrlY,
+            180, 26, hwnd_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kQueryEditId)), inst,
+            nullptr);
         searchButton_ = CreateWindowExW(
             0, L"BUTTON", L"Lookup",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 200, 9, 68,
-            28, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSearchBtnId)),
-            inst, nullptr);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 200, ctrlY - 1,
+            68, 28, hwnd_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSearchBtnId)), inst,
+            nullptr);
         speakButton_ = CreateWindowExW(
             0, L"BUTTON", L"Speak",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 274, 9, 68, 28,
-            hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSpeakBtnId)),
-            inst, nullptr);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 274, ctrlY - 1,
+            68, 28, hwnd_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSpeakBtnId)), inst,
+            nullptr);
         copyButton_ = CreateWindowExW(
             0, L"BUTTON", L"Copy Syns",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 348, 9, 104,
-            28, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCopyBtnId)),
-            inst, nullptr);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 348, ctrlY - 1,
+            104, 28, hwnd_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCopyBtnId)), inst,
+            nullptr);
         for (HWND ctl : {queryEdit_, searchButton_, speakButton_, copyButton_}) {
             if (ctl != nullptr && guiFont != nullptr) {
                 SendMessageW(ctl, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont),
@@ -1260,22 +1401,33 @@ LRESULT WordDefinitionWindow::handle_message(UINT msg, WPARAM wParam,
         if (id == kSearchBtnId && code == BN_CLICKED && queryEdit_ != nullptr) {
             wchar_t buf[128]{};
             GetWindowTextW(queryEdit_, buf, 128);
-            start_lookup(utf8_from_wide(buf));
-            return 0;
-        }
-        if (id == kSpeakBtnId && code == BN_CLICKED) {
-            if (onSpeakWord_ && !activeWord_.empty()) {
-                onSpeakWord_(activeWord_);
+            const std::string text = utf8_from_wide(buf);
+            if (tabs_.empty()) {
+                open_tab(text);
+            } else if (tabs_[activeTabIndex_].queryWord.empty()) {
+                start_lookup_for_tab(activeTabIndex_, text);
+            } else if (tabs_[activeTabIndex_].queryWord != text) {
+                open_tab(text);
             }
             return 0;
         }
-        if (id == kCopyBtnId && code == BN_CLICKED && !result_.synonyms.empty()) {
+        if (id == kSpeakBtnId && code == BN_CLICKED) {
+            const std::string w = active_word();
+            if (onSpeakWord_ && !w.empty()) {
+                onSpeakWord_(w);
+            }
+            return 0;
+        }
+        if (id == kCopyBtnId && code == BN_CLICKED &&
+            activeTabIndex_ < tabs_.size() &&
+            !tabs_[activeTabIndex_].result.synonyms.empty()) {
+            const auto& syns = tabs_[activeTabIndex_].result.synonyms;
             std::string joined;
-            for (std::size_t i = 0; i < result_.synonyms.size(); ++i) {
+            for (std::size_t i = 0; i < syns.size(); ++i) {
                 if (i > 0) {
                     joined += ", ";
                 }
-                joined += result_.synonyms[i];
+                joined += syns[i];
             }
             copy_text_to_clipboard(hwnd_, joined);
             return 0;
@@ -1284,18 +1436,30 @@ LRESULT WordDefinitionWindow::handle_message(UINT msg, WPARAM wParam,
     }
     case kMsgLookupReady: {
         const std::uint64_t seq = static_cast<std::uint64_t>(wParam);
-        if (seq != requestSeq_) {
-            return 0;
-        }
+        const std::size_t targetTabIndex = static_cast<std::size_t>(lParam);
+        WordLookupResult res;
         if (pendingState_) {
             std::scoped_lock lock(pendingState_->mutex);
-            if (pendingState_->seq == requestSeq_) {
-                result_ = std::move(pendingState_->result);
+            if (pendingState_->seq == seq) {
+                res = std::move(pendingState_->result);
             }
         }
-        loading_ = false;
-        if (copyButton_ != nullptr) {
-            EnableWindow(copyButton_, result_.synonyms.empty() ? FALSE : TRUE);
+        for (std::size_t i = 0; i < tabs_.size(); ++i) {
+            if (tabs_[i].requestSeq == seq ||
+                (i == targetTabIndex && tabs_[i].loading)) {
+                tabs_[i].result = std::move(res);
+                tabs_[i].loading = false;
+                break;
+            }
+        }
+        if (activeTabIndex_ < tabs_.size()) {
+            if (copyButton_ != nullptr) {
+                EnableWindow(copyButton_,
+                             tabs_[activeTabIndex_].result.synonyms.empty()
+                                 ? FALSE
+                                 : TRUE);
+            }
+            update_scroll_bar();
         }
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
@@ -1303,15 +1467,41 @@ LRESULT WordDefinitionWindow::handle_message(UINT msg, WPARAM wParam,
     case WM_MOUSEMOVE: {
         const POINT pt{static_cast<LONG>(static_cast<SHORT>(LOWORD(lParam))),
                        static_cast<LONG>(static_cast<SHORT>(HIWORD(lParam)))};
-        int found = -1;
-        for (int i = 0; i < static_cast<int>(synonymPills_.size()); ++i) {
-            if (PtInRect(&synonymPills_[static_cast<std::size_t>(i)].bounds, pt)) {
-                found = i;
-                break;
+        int foundPill = -1;
+        int foundTab = -1;
+        int foundClose = -1;
+        bool foundNewTab = false;
+
+        if (pt.y < kTabBarHeight) {
+            if (PtInRect(&newTabBounds_, pt)) {
+                foundNewTab = true;
+            } else {
+                for (const auto& th : tabHeaders_) {
+                    if (PtInRect(&th.closeBounds, pt)) {
+                        foundClose = static_cast<int>(th.tabIndex);
+                        break;
+                    } else if (PtInRect(&th.tabBounds, pt)) {
+                        foundTab = static_cast<int>(th.tabIndex);
+                        break;
+                    }
+                }
+            }
+        } else if (pt.y >= kTopBarHeight) {
+            for (int i = 0; i < static_cast<int>(synonymPills_.size()); ++i) {
+                if (PtInRect(&synonymPills_[static_cast<std::size_t>(i)].bounds,
+                             pt)) {
+                    foundPill = i;
+                    break;
+                }
             }
         }
-        if (found != hoveredPill_) {
-            hoveredPill_ = found;
+
+        if (foundPill != hoveredPill_ || foundTab != hoveredTab_ ||
+            foundClose != hoveredClose_ || foundNewTab != hoveredNewTab_) {
+            hoveredPill_ = foundPill;
+            hoveredTab_ = foundTab;
+            hoveredClose_ = foundClose;
+            hoveredNewTab_ = foundNewTab;
             InvalidateRect(hwnd_, nullptr, FALSE);
         }
         return 0;
@@ -1319,42 +1509,67 @@ LRESULT WordDefinitionWindow::handle_message(UINT msg, WPARAM wParam,
     case WM_LBUTTONDOWN: {
         const POINT pt{static_cast<LONG>(static_cast<SHORT>(LOWORD(lParam))),
                        static_cast<LONG>(static_cast<SHORT>(HIWORD(lParam)))};
-        for (const auto& pill : synonymPills_) {
-            if (PtInRect(&pill.bounds, pt)) {
-                start_lookup(pill.word);
+        if (pt.y < kTabBarHeight) {
+            if (PtInRect(&newTabBounds_, pt)) {
+                open_new_empty_tab();
                 return 0;
+            }
+            for (const auto& th : tabHeaders_) {
+                if (PtInRect(&th.closeBounds, pt)) {
+                    close_tab(th.tabIndex);
+                    return 0;
+                }
+                if (PtInRect(&th.tabBounds, pt)) {
+                    select_tab(th.tabIndex);
+                    return 0;
+                }
+            }
+            return 0;
+        }
+        if (pt.y >= kTopBarHeight) {
+            for (const auto& pill : synonymPills_) {
+                if (PtInRect(&pill.bounds, pt)) {
+                    open_tab(pill.word);
+                    return 0;
+                }
             }
         }
         return 0;
     }
     case WM_MOUSEWHEEL: {
         const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-        scrollY_ -= (delta / WHEEL_DELTA) * 36;
-        update_scroll_bar();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        if (activeTabIndex_ < tabs_.size()) {
+            tabs_[activeTabIndex_].scrollY -= (delta / WHEEL_DELTA) * 36;
+            update_scroll_bar();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
         return 0;
     }
     case WM_VSCROLL: {
+        if (activeTabIndex_ >= tabs_.size()) {
+            return 0;
+        }
+        auto& curTab = tabs_[activeTabIndex_];
         SCROLLINFO si{};
         si.cbSize = sizeof(si);
         si.fMask = SIF_ALL;
         GetScrollInfo(hwnd_, SB_VERT, &si);
         switch (LOWORD(wParam)) {
         case SB_LINEUP:
-            scrollY_ -= 24;
+            curTab.scrollY -= 24;
             break;
         case SB_LINEDOWN:
-            scrollY_ += 24;
+            curTab.scrollY += 24;
             break;
         case SB_PAGEUP:
-            scrollY_ -= static_cast<int>(si.nPage);
+            curTab.scrollY -= static_cast<int>(si.nPage);
             break;
         case SB_PAGEDOWN:
-            scrollY_ += static_cast<int>(si.nPage);
+            curTab.scrollY += static_cast<int>(si.nPage);
             break;
         case SB_THUMBTRACK:
         case SB_THUMBPOSITION:
-            scrollY_ = si.nTrackPos;
+            curTab.scrollY = si.nTrackPos;
             break;
         default:
             break;
@@ -1377,6 +1592,29 @@ LRESULT WordDefinitionWindow::handle_message(UINT msg, WPARAM wParam,
             ShowWindow(hwnd_, SW_HIDE);
             return 0;
         }
+        if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+            if (wParam == 'W') {
+                close_tab(activeTabIndex_);
+                return 0;
+            }
+            if (wParam == 'T') {
+                open_new_empty_tab();
+                return 0;
+            }
+            if (wParam == VK_TAB || wParam == VK_NEXT) {
+                if (!tabs_.empty()) {
+                    select_tab((activeTabIndex_ + 1) % tabs_.size());
+                }
+                return 0;
+            }
+            if (wParam == VK_PRIOR) {
+                if (!tabs_.empty()) {
+                    select_tab((activeTabIndex_ + tabs_.size() - 1) %
+                               tabs_.size());
+                }
+                return 0;
+            }
+        }
         break;
     case WM_CLOSE:
         ShowWindow(hwnd_, SW_HIDE);
@@ -1395,8 +1633,10 @@ LRESULT WordDefinitionWindow::handle_message(UINT msg, WPARAM wParam,
 }
 
 void WordDefinitionWindow::paint_canvas(HDC hdc, const RECT& clientRect) {
-    const int width = std::max(1, static_cast<int>(clientRect.right - clientRect.left));
-    const int height = std::max(1, static_cast<int>(clientRect.bottom - clientRect.top));
+    const int width =
+        std::max(1, static_cast<int>(clientRect.right - clientRect.left));
+    const int height =
+        std::max(1, static_cast<int>(clientRect.bottom - clientRect.top));
 
     HDC memDc = CreateCompatibleDC(hdc);
     HBITMAP memBmp = CreateCompatibleBitmap(hdc, width, height);
@@ -1409,19 +1649,154 @@ void WordDefinitionWindow::paint_canvas(HDC hdc, const RECT& clientRect) {
     const COLORREF textCol = colorref_from_hex(tokens.text);
     const COLORREF focusCol = colorref_from_hex(tokens.focus);
     const COLORREF pillHoverCol = colorref_from_hex(tokens.sentenceHighlight);
-    const COLORREF mutedCol = blend_color(textCol, bgCol, 0.35F);
+    const COLORREF mutedCol = blend_color(textCol, bgCol, 0.38F);
+    const COLORREF tabStripBg = blend_color(surfaceCol, borderCol, 0.18F);
 
+    // 1. Background fill
     {
         GdiObjectGuard bgBrush(CreateSolidBrush(bgCol));
         FillRect(memDc, &clientRect, static_cast<HBRUSH>(bgBrush.obj));
-        const RECT topRc{0, 0, width, kTopBarHeight};
-        GdiObjectGuard topBrush(CreateSolidBrush(surfaceCol));
-        FillRect(memDc, &topRc, static_cast<HBRUSH>(topBrush.obj));
+    }
+
+    // 2. Tab Strip area (Y = 0 .. kTabBarHeight)
+    {
+        const RECT tabStripRc{0, 0, width, kTabBarHeight};
+        GdiObjectGuard stripBrush(CreateSolidBrush(tabStripBg));
+        FillRect(memDc, &tabStripRc, static_cast<HBRUSH>(stripBrush.obj));
+        GdiObjectGuard pen(CreatePen(PS_SOLID, 1, borderCol));
+        HGDIOBJ oldP = SelectObject(memDc, pen.obj);
+        MoveToEx(memDc, 0, kTabBarHeight - 1, nullptr);
+        LineTo(memDc, width, kTabBarHeight - 1);
+        SelectObject(memDc, oldP);
+    }
+
+    // 3. Toolbar area (Y = kTabBarHeight .. kTopBarHeight)
+    {
+        const RECT toolRc{0, kTabBarHeight, width, kTopBarHeight};
+        GdiObjectGuard toolBrush(CreateSolidBrush(surfaceCol));
+        FillRect(memDc, &toolRc, static_cast<HBRUSH>(toolBrush.obj));
         GdiObjectGuard pen(CreatePen(PS_SOLID, 1, borderCol));
         HGDIOBJ oldP = SelectObject(memDc, pen.obj);
         MoveToEx(memDc, 0, kTopBarHeight - 1, nullptr);
         LineTo(memDc, width, kTopBarHeight - 1);
         SelectObject(memDc, oldP);
+    }
+
+    // 4. Tab Headers
+    tabHeaders_.clear();
+    const std::size_t nTabs = tabs_.size();
+    if (nTabs > 0) {
+        const int reservedForPlus = 36;
+        const int availTabW = width - 12 - reservedForPlus;
+        const int maxTabW = 145;
+        const int minTabW = 75;
+        const int tabW = std::clamp(
+            availTabW / static_cast<int>(nTabs), minTabW, maxTabW);
+
+        int curX = 8;
+        for (std::size_t i = 0; i < nTabs; ++i) {
+            const bool isActive = (i == activeTabIndex_);
+            const bool isHovered = (static_cast<int>(i) == hoveredTab_);
+            const bool isCloseHovered = (static_cast<int>(i) == hoveredClose_);
+            const auto& tab = tabs_[i];
+
+            RECT tabRc{curX, isActive ? 2 : 5, curX + tabW, kTabBarHeight};
+            if (!isActive) {
+                tabRc.bottom = kTabBarHeight - 1;
+            }
+
+            const COLORREF tabFill =
+                isActive ? surfaceCol
+                         : (isHovered
+                                ? blend_color(surfaceCol, pillHoverCol, 0.5F)
+                                : tabStripBg);
+            {
+                GdiObjectGuard tBrush(CreateSolidBrush(tabFill));
+                GdiObjectGuard tPen(CreatePen(PS_SOLID, 1, borderCol));
+                HGDIOBJ ob = SelectObject(memDc, tBrush.obj);
+                HGDIOBJ op = SelectObject(memDc, tPen.obj);
+                RoundRect(memDc, tabRc.left, tabRc.top, tabRc.right,
+                          tabRc.bottom + (isActive ? 4 : 0), 8, 8);
+                SelectObject(memDc, op);
+                SelectObject(memDc, ob);
+            }
+
+            if (isActive) {
+                RECT topBarRc{tabRc.left + 2, tabRc.top, tabRc.right - 2,
+                              tabRc.top + 3};
+                GdiObjectGuard topBarBrush(CreateSolidBrush(focusCol));
+                FillRect(memDc, &topBarRc, static_cast<HBRUSH>(topBarBrush.obj));
+            }
+
+            std::string displayWord =
+                tab.queryWord.empty() ? "New Tab" : tab.queryWord;
+            if (tab.loading) {
+                displayWord += "...";
+            }
+            const std::wstring wideTitle = wide_from_utf8(displayWord);
+            GdiObjectGuard tabFont(
+                create_ui_font(13, isActive ? FW_BOLD : FW_SEMIBOLD));
+            HGDIOBJ oldF = SelectObject(memDc, tabFont.obj);
+            SetTextColor(memDc, isActive ? textCol : mutedCol);
+            RECT titleRc{tabRc.left + 8, tabRc.top, tabRc.right - 22,
+                         tabRc.bottom};
+            DrawTextW(memDc, wideTitle.c_str(), static_cast<int>(wideTitle.size()),
+                      &titleRc,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SelectObject(memDc, oldF);
+
+            // Tab Close Button [x]
+            const int closeTop =
+                tabRc.top + (tabRc.bottom - tabRc.top - 16) / 2;
+            RECT closeRc{tabRc.right - 20, closeTop, tabRc.right - 4,
+                         closeTop + 16};
+            if (isCloseHovered) {
+                GdiObjectGuard cBrush(CreateSolidBrush(
+                    blend_color(surfaceCol, focusCol, 0.25F)));
+                GdiObjectGuard cPen(CreatePen(PS_SOLID, 1, focusCol));
+                HGDIOBJ ob = SelectObject(memDc, cBrush.obj);
+                HGDIOBJ op = SelectObject(memDc, cPen.obj);
+                RoundRect(memDc, closeRc.left, closeRc.top, closeRc.right,
+                          closeRc.bottom, 4, 4);
+                SelectObject(memDc, op);
+                SelectObject(memDc, ob);
+            }
+            GdiObjectGuard closeFont(create_ui_font(11, FW_BOLD));
+            HGDIOBJ oldCloseF = SelectObject(memDc, closeFont.obj);
+            SetTextColor(memDc, isCloseHovered ? focusCol : mutedCol);
+            DrawTextW(memDc, L"\x00D7", 1, &closeRc,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(memDc, oldCloseF);
+
+            TabHeaderLayout header;
+            header.tabIndex = i;
+            header.tabBounds = tabRc;
+            header.closeBounds = closeRc;
+            tabHeaders_.push_back(header);
+
+            curX += tabW + 3;
+        }
+
+        // New Tab Button [+]
+        newTabBounds_ = {curX + 2, 6, curX + 26, 26};
+        {
+            GdiObjectGuard pBrush(
+                CreateSolidBrush(hoveredNewTab_ ? surfaceCol : tabStripBg));
+            GdiObjectGuard pPen(CreatePen(PS_SOLID, 1,
+                                          hoveredNewTab_ ? focusCol : borderCol));
+            HGDIOBJ ob = SelectObject(memDc, pBrush.obj);
+            HGDIOBJ op = SelectObject(memDc, pPen.obj);
+            RoundRect(memDc, newTabBounds_.left, newTabBounds_.top,
+                      newTabBounds_.right, newTabBounds_.bottom, 6, 6);
+            SelectObject(memDc, op);
+            SelectObject(memDc, ob);
+        }
+        GdiObjectGuard plusFont(create_ui_font(14, FW_BOLD));
+        HGDIOBJ oldPlusF = SelectObject(memDc, plusFont.obj);
+        SetTextColor(memDc, hoveredNewTab_ ? focusCol : mutedCol);
+        DrawTextW(memDc, L"+", 1, &newTabBounds_,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(memDc, oldPlusF);
     }
 
     synonymPills_.clear();
@@ -1431,155 +1806,181 @@ void WordDefinitionWindow::paint_canvas(HDC hdc, const RECT& clientRect) {
     const int saveState = SaveDC(memDc);
     IntersectClipRect(memDc, 0, kTopBarHeight, width, height);
 
-    const int padX = 18;
-    const int contentW = std::max(180, width - padX * 2);
-    int y = kTopBarHeight + 14 - scrollY_;
+    if (activeTabIndex_ < tabs_.size()) {
+        auto& curTab = tabs_[activeTabIndex_];
+        const auto& result = curTab.result;
+        const int padX = 18;
+        const int contentW = std::max(180, width - padX * 2);
+        int y = kTopBarHeight + 14 - curTab.scrollY;
 
-    // Word header + phonetic
-    {
-        GdiObjectGuard headFont(create_ui_font(26, FW_BOLD));
-        HGDIOBJ oldFont = SelectObject(memDc, headFont.obj);
-        SetTextColor(memDc, textCol);
-        std::wstring header = wide_from_utf8(activeWord_);
-        if (!result_.phonetic.empty()) {
-            header += L"   " + wide_from_utf8(result_.phonetic);
-        }
-        RECT hRc{padX, y, padX + contentW, y + 40};
-        const int used =
-            DrawTextW(memDc, header.c_str(), static_cast<int>(header.size()),
-                      &hRc, DT_LEFT | DT_WORDBREAK);
-        y += std::max(28, used) + 8;
-        SelectObject(memDc, oldFont);
-    }
-
-    if (loading_) {
-        GdiObjectGuard infoFont(create_ui_font(16, FW_NORMAL));
-        HGDIOBJ oldFont = SelectObject(memDc, infoFont.obj);
-        SetTextColor(memDc, mutedCol);
-        RECT msgRc{padX, y, padX + contentW, y + 40};
-        DrawTextW(memDc, L"Fetching definition and synonyms...", -1, &msgRc,
-                  DT_LEFT | DT_SINGLELINE);
-        SelectObject(memDc, oldFont);
-        contentHeight_ = y + scrollY_ + 60;
-    } else if (!result_.errorMessage.empty()) {
-        GdiObjectGuard errFont(create_ui_font(16, FW_NORMAL));
-        HGDIOBJ oldFont = SelectObject(memDc, errFont.obj);
-        SetTextColor(memDc, textCol);
-        const std::wstring msg = wide_from_utf8(result_.errorMessage);
-        RECT msgRc{padX, y, padX + contentW, y + 120};
-        const int used = DrawTextW(memDc, msg.c_str(),
-                                   static_cast<int>(msg.size()), &msgRc,
-                                   DT_LEFT | DT_WORDBREAK);
-        SelectObject(memDc, oldFont);
-        contentHeight_ = y + scrollY_ + used + 24;
-    } else {
-        // Synonyms section
-        if (!result_.synonyms.empty()) {
-            GdiObjectGuard secFont(create_ui_font(13, FW_BOLD));
-            HGDIOBJ oldSec = SelectObject(memDc, secFont.obj);
-            SetTextColor(memDc, focusCol);
-            RECT secRc{padX, y, padX + contentW, y + 22};
-            DrawTextW(memDc, L"SYNONYMS (click any to explore)", -1, &secRc,
-                      DT_LEFT | DT_SINGLELINE);
-            SelectObject(memDc, oldSec);
-            y += 24;
-
-            GdiObjectGuard chipFont(create_ui_font(15, FW_SEMIBOLD));
-            HGDIOBJ oldChip = SelectObject(memDc, chipFont.obj);
-            int px = padX;
-            const int pillH = 28;
-            for (int i = 0; i < static_cast<int>(result_.synonyms.size()); ++i) {
-                const std::string& syn = result_.synonyms[static_cast<std::size_t>(i)];
-                const std::wstring ws = wide_from_utf8(syn);
-                SIZE sz{};
-                GetTextExtentPoint32W(memDc, ws.c_str(),
-                                      static_cast<int>(ws.size()), &sz);
-                const int pillW = static_cast<int>(sz.cx) + 20;
-                if (px > padX && px + pillW > padX + contentW) {
-                    px = padX;
-                    y += pillH + 8;
-                }
-                RECT pillRc{px, y, px + pillW, y + pillH};
-                const bool hovered = (i == hoveredPill_);
-                GdiObjectGuard pBrush(
-                    CreateSolidBrush(hovered ? pillHoverCol : surfaceCol));
-                GdiObjectGuard pPen(
-                    CreatePen(PS_SOLID, hovered ? 2 : 1,
-                              hovered ? focusCol : borderCol));
-                HGDIOBJ ob = SelectObject(memDc, pBrush.obj);
-                HGDIOBJ op = SelectObject(memDc, pPen.obj);
-                RoundRect(memDc, pillRc.left, pillRc.top, pillRc.right,
-                          pillRc.bottom, 14, 14);
-                SelectObject(memDc, op);
-                SelectObject(memDc, ob);
-
+        if (curTab.queryWord.empty()) {
+            GdiObjectGuard infoFont(create_ui_font(16, FW_NORMAL));
+            HGDIOBJ oldFont = SelectObject(memDc, infoFont.obj);
+            SetTextColor(memDc, mutedCol);
+            RECT msgRc{padX, y + 30, padX + contentW, y + 140};
+            DrawTextW(memDc,
+                      L"Type any word in the search box above and click Lookup,\n"
+                      L"or click any synonym pill in an open tab to explore without losing starting word.",
+                      -1, &msgRc, DT_CENTER | DT_WORDBREAK);
+            SelectObject(memDc, oldFont);
+            curTab.contentHeight = 140;
+        } else {
+            // Word header + phonetic
+            {
+                GdiObjectGuard headFont(create_ui_font(26, FW_BOLD));
+                HGDIOBJ oldFont = SelectObject(memDc, headFont.obj);
                 SetTextColor(memDc, textCol);
-                DrawTextW(memDc, ws.c_str(), static_cast<int>(ws.size()),
-                          &pillRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                if (pillRc.bottom > kTopBarHeight && pillRc.top < height) {
-                    synonymPills_.push_back(SynonymPill{syn, pillRc});
+                std::wstring header = wide_from_utf8(curTab.queryWord);
+                if (!result.phonetic.empty()) {
+                    header += L"   " + wide_from_utf8(result.phonetic);
                 }
-                px += pillW + 8;
+                RECT hRc{padX, y, padX + contentW, y + 40};
+                const int used = DrawTextW(
+                    memDc, header.c_str(), static_cast<int>(header.size()),
+                    &hRc, DT_LEFT | DT_WORDBREAK);
+                y += std::max(28, used) + 8;
+                SelectObject(memDc, oldFont);
             }
-            SelectObject(memDc, oldChip);
-            y += pillH + 16;
-        }
 
-        // Definitions section
-        if (!result_.definitions.empty()) {
-            GdiObjectGuard secFont(create_ui_font(13, FW_BOLD));
-            HGDIOBJ oldSec = SelectObject(memDc, secFont.obj);
-            SetTextColor(memDc, focusCol);
-            RECT secRc{padX, y, padX + contentW, y + 22};
-            DrawTextW(memDc, L"DEFINITIONS", -1, &secRc, DT_LEFT | DT_SINGLELINE);
-            SelectObject(memDc, oldSec);
-            y += 26;
-
-            for (std::size_t i = 0; i < result_.definitions.size(); ++i) {
-                const auto& def = result_.definitions[i];
-                if (!def.partOfSpeech.empty()) {
-                    GdiObjectGuard posFont(create_ui_font(13, FW_BOLD));
-                    HGDIOBJ oldPos = SelectObject(memDc, posFont.obj);
+            if (curTab.loading) {
+                GdiObjectGuard infoFont(create_ui_font(16, FW_NORMAL));
+                HGDIOBJ oldFont = SelectObject(memDc, infoFont.obj);
+                SetTextColor(memDc, mutedCol);
+                RECT msgRc{padX, y, padX + contentW, y + 40};
+                DrawTextW(memDc, L"Fetching definition and synonyms...", -1,
+                          &msgRc, DT_LEFT | DT_SINGLELINE);
+                SelectObject(memDc, oldFont);
+                curTab.contentHeight = y + curTab.scrollY + 60;
+            } else if (!result.errorMessage.empty()) {
+                GdiObjectGuard errFont(create_ui_font(16, FW_NORMAL));
+                HGDIOBJ oldFont = SelectObject(memDc, errFont.obj);
+                SetTextColor(memDc, textCol);
+                const std::wstring msg = wide_from_utf8(result.errorMessage);
+                RECT msgRc{padX, y, padX + contentW, y + 120};
+                const int used = DrawTextW(
+                    memDc, msg.c_str(), static_cast<int>(msg.size()), &msgRc,
+                    DT_LEFT | DT_WORDBREAK);
+                SelectObject(memDc, oldFont);
+                curTab.contentHeight = y + curTab.scrollY + used + 24;
+            } else {
+                // Synonyms section
+                if (!result.synonyms.empty()) {
+                    GdiObjectGuard secFont(create_ui_font(13, FW_BOLD));
+                    HGDIOBJ oldSec = SelectObject(memDc, secFont.obj);
                     SetTextColor(memDc, focusCol);
-                    const std::wstring pos =
-                        wide_from_utf8(def.partOfSpeech);
-                    RECT posRc{padX, y, padX + contentW, y + 20};
-                    DrawTextW(memDc, pos.c_str(), static_cast<int>(pos.size()),
-                              &posRc, DT_LEFT | DT_SINGLELINE);
-                    SelectObject(memDc, oldPos);
-                    y += 20;
+                    RECT secRc{padX, y, padX + contentW, y + 22};
+                    DrawTextW(memDc, L"SYNONYMS (click any to open in a new tab)", -1,
+                              &secRc, DT_LEFT | DT_SINGLELINE);
+                    SelectObject(memDc, oldSec);
+                    y += 24;
+
+                    GdiObjectGuard chipFont(create_ui_font(15, FW_SEMIBOLD));
+                    HGDIOBJ oldChip = SelectObject(memDc, chipFont.obj);
+                    int px = padX;
+                    const int pillH = 28;
+                    for (int i = 0; i < static_cast<int>(result.synonyms.size());
+                         ++i) {
+                        const std::string& syn =
+                            result.synonyms[static_cast<std::size_t>(i)];
+                        const std::wstring ws = wide_from_utf8(syn);
+                        SIZE sz{};
+                        GetTextExtentPoint32W(memDc, ws.c_str(),
+                                              static_cast<int>(ws.size()), &sz);
+                        const int pillW = static_cast<int>(sz.cx) + 20;
+                        if (px > padX && px + pillW > padX + contentW) {
+                            px = padX;
+                            y += pillH + 8;
+                        }
+                        RECT pillRc{px, y, px + pillW, y + pillH};
+                        const bool hovered = (i == hoveredPill_);
+                        GdiObjectGuard pBrush(CreateSolidBrush(
+                            hovered ? pillHoverCol : surfaceCol));
+                        GdiObjectGuard pPen(CreatePen(
+                            PS_SOLID, hovered ? 2 : 1,
+                            hovered ? focusCol : borderCol));
+                        HGDIOBJ ob = SelectObject(memDc, pBrush.obj);
+                        HGDIOBJ op = SelectObject(memDc, pPen.obj);
+                        RoundRect(memDc, pillRc.left, pillRc.top, pillRc.right,
+                                  pillRc.bottom, 14, 14);
+                        SelectObject(memDc, op);
+                        SelectObject(memDc, ob);
+
+                        SetTextColor(memDc, textCol);
+                        DrawTextW(memDc, ws.c_str(),
+                                  static_cast<int>(ws.size()), &pillRc,
+                                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                        if (pillRc.bottom > kTopBarHeight && pillRc.top < height) {
+                            synonymPills_.push_back(SynonymPill{syn, pillRc});
+                        }
+                        px += pillW + 8;
+                    }
+                    SelectObject(memDc, oldChip);
+                    y += pillH + 16;
                 }
 
-                GdiObjectGuard defFont(create_ui_font(16, FW_NORMAL));
-                HGDIOBJ oldDef = SelectObject(memDc, defFont.obj);
-                SetTextColor(memDc, textCol);
-                const std::wstring text =
-                    std::to_wstring(i + 1) + L". " +
-                    wide_from_utf8(def.definition);
-                RECT calcRc{padX, y, padX + contentW, y + 1000};
-                const int defH = DrawTextW(memDc, text.c_str(),
-                                           static_cast<int>(text.size()),
-                                           &calcRc, DT_LEFT | DT_WORDBREAK);
-                y += defH + 4;
-                SelectObject(memDc, oldDef);
+                // Definitions section
+                if (!result.definitions.empty()) {
+                    GdiObjectGuard secFont(create_ui_font(13, FW_BOLD));
+                    HGDIOBJ oldSec = SelectObject(memDc, secFont.obj);
+                    SetTextColor(memDc, focusCol);
+                    RECT secRc{padX, y, padX + contentW, y + 22};
+                    DrawTextW(memDc, L"DEFINITIONS", -1, &secRc,
+                              DT_LEFT | DT_SINGLELINE);
+                    SelectObject(memDc, oldSec);
+                    y += 26;
 
-                if (!def.example.empty()) {
-                    GdiObjectGuard exFont(create_ui_font(14, FW_NORMAL));
-                    HGDIOBJ oldEx = SelectObject(memDc, exFont.obj);
-                    SetTextColor(memDc, mutedCol);
-                    const std::wstring exText =
-                        L"Example: \"" + wide_from_utf8(def.example) + L"\"";
-                    RECT exRc{padX + 12, y, padX + contentW, y + 400};
-                    const int exH = DrawTextW(memDc, exText.c_str(),
-                                              static_cast<int>(exText.size()),
-                                              &exRc, DT_LEFT | DT_WORDBREAK);
-                    y += exH + 4;
-                    SelectObject(memDc, oldEx);
+                    for (std::size_t i = 0; i < result.definitions.size(); ++i) {
+                        const auto& def = result.definitions[i];
+                        if (!def.partOfSpeech.empty()) {
+                            GdiObjectGuard posFont(create_ui_font(13, FW_BOLD));
+                            HGDIOBJ oldPos = SelectObject(memDc, posFont.obj);
+                            SetTextColor(memDc, focusCol);
+                            const std::wstring pos =
+                                wide_from_utf8(def.partOfSpeech);
+                            RECT posRc{padX, y, padX + contentW, y + 20};
+                            DrawTextW(memDc, pos.c_str(),
+                                      static_cast<int>(pos.size()), &posRc,
+                                      DT_LEFT | DT_SINGLELINE);
+                            SelectObject(memDc, oldPos);
+                            y += 20;
+                        }
+
+                        GdiObjectGuard defFont(create_ui_font(16, FW_NORMAL));
+                        HGDIOBJ oldDef = SelectObject(memDc, defFont.obj);
+                        SetTextColor(memDc, textCol);
+                        const std::wstring text =
+                            std::to_wstring(i + 1) + L". " +
+                            wide_from_utf8(def.definition);
+                        RECT calcRc{padX, y, padX + contentW, y + 1000};
+                        const int defH = DrawTextW(
+                            memDc, text.c_str(), static_cast<int>(text.size()),
+                            &calcRc, DT_LEFT | DT_WORDBREAK);
+                        y += defH + 4;
+                        SelectObject(memDc, oldDef);
+
+                        if (!def.example.empty()) {
+                            GdiObjectGuard exFont(
+                                create_ui_font(14, FW_NORMAL));
+                            HGDIOBJ oldEx = SelectObject(memDc, exFont.obj);
+                            SetTextColor(memDc, mutedCol);
+                            const std::wstring exText =
+                                L"Example: \"" + wide_from_utf8(def.example) +
+                                L"\"";
+                            RECT exRc{padX + 12, y, padX + contentW, y + 400};
+                            const int exH = DrawTextW(
+                                memDc, exText.c_str(),
+                                static_cast<int>(exText.size()), &exRc,
+                                DT_LEFT | DT_WORDBREAK);
+                            y += exH + 4;
+                            SelectObject(memDc, oldEx);
+                        }
+                        y += 10;
+                    }
                 }
-                y += 10;
+                curTab.contentHeight =
+                    (y + curTab.scrollY) - kTopBarHeight + 16;
             }
         }
-        contentHeight_ = (y + scrollY_) - kTopBarHeight + 16;
     }
 
     RestoreDC(memDc, saveState);
@@ -1590,5 +1991,6 @@ void WordDefinitionWindow::paint_canvas(HDC hdc, const RECT& clientRect) {
     DeleteObject(memBmp);
     DeleteDC(memDc);
 }
+
 
 }  // namespace dyslexia_reader::windows
